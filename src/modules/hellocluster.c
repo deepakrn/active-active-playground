@@ -61,8 +61,11 @@ int ListCommand_ValkeyCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, i
 
     ValkeyModule_ReplyWithArray(ctx, numnodes);
     for (size_t j = 0; j < numnodes; j++) {
+        char id[VALKEYMODULE_NODE_ID_LEN + 1];
+        memcpy(id, ids[j], VALKEYMODULE_NODE_ID_LEN);
+        id[VALKEYMODULE_NODE_ID_LEN] = '\0';
         int port;
-        ValkeyModule_GetClusterNodeInfo(ctx, ids[j], NULL, NULL, &port, NULL);
+        ValkeyModule_GetClusterNodeInfo(ctx, id, NULL, NULL, &port, NULL);
         ValkeyModule_ReplyWithArray(ctx, 2);
         ValkeyModule_ReplyWithStringBuffer(ctx, ids[j], VALKEYMODULE_NODE_ID_LEN);
         ValkeyModule_ReplyWithLongLong(ctx, port);
