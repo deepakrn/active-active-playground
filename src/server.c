@@ -1348,6 +1348,11 @@ void databasesCron(void) {
         }
     }
 
+    /* Run Active-Active CRDT Tombstone Garbage Collection sweep */
+    if (server.active_active_enabled) {
+        crdtCronGCSweep();
+    }
+
     /* Start active defrag cycle or adjust defrag CPU if needed. */
     monitorActiveDefrag();
 
@@ -2356,6 +2361,12 @@ void initServerConfig(void) {
     server.active_expire_enabled = 1;
     server.lazy_expire_disabled = 0;
     server.skip_checksum_validation = 0;
+    server.active_active_enabled = 0;
+    server.origin_id = 1;
+    server.peer_aa_buffer_limit = 64 * 1024 * 1024;
+    server.aa_gc_lease_ms = 3600000;
+    server.crdt_peers = NULL;
+    memset(&server.crdt_gc_stats, 0, sizeof(server.crdt_gc_stats));
     server.loading = 0;
     server.async_loading = 0;
     server.loading_rdb_used_mem = 0;
@@ -3039,6 +3050,8 @@ void initServer(void) {
     adjustOpenFilesLimit();
     const char *clk_msg = monotonicInit();
     serverLog(LL_NOTICE, "monotonic clock: %s", clk_msg);
+    crdtClockInit(&server.crdt_clock, server.origin_id, CRDT_DEFAULT_MAX_BORROW_MS, CRDT_DEFAULT_MAX_SKEW_MS);
+    crdtGcInit();
     server.el = aeCreateEventLoop(server.maxclients + CONFIG_FDSET_INCR);
     if (server.el == NULL) {
         serverLog(LL_WARNING, "Failed creating the event loop. Error message: '%s'", strerror(errno));
@@ -6831,6 +6844,12 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
     if (all_sections || (dictFind(section_dict, "scriptingengines") != NULL)) {
         if (sections++) info = sdscat(info, "\r\n");
         info = genValkeyInfoStringScriptingEngines(info);
+    }
+
+    /* CRDT Active-Active */
+    if (all_sections || (dictFind(section_dict, "crdt") != NULL)) {
+        if (sections++) info = sdscat(info, "\r\n");
+        info = genCrdtInfoString(info);
     }
 
     /* Key space */

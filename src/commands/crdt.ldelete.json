@@ -1,0 +1,61 @@
+{
+    "CRDT.LDELETE": {
+        "summary": "Active-Active CRDT List delete replication command.",
+        "complexity": "O(log N)",
+        "group": "list",
+        "since": "8.0.0",
+        "arity": 6,
+        "function": "crdtLDeleteCommand",
+        "command_flags": [
+            "WRITE"
+        ],
+        "acl_categories": [
+            "LIST",
+            "SLOW",
+            "WRITE"
+        ],
+        "key_specs": [
+            {
+                "flags": [
+                    "RW",
+                    "DELETE"
+                ],
+                "begin_search": {
+                    "index": {
+                        "pos": 1
+                    }
+                },
+                "find_keys": {
+                    "range": {
+                        "lastkey": 0,
+                        "step": 1,
+                        "limit": 0
+                    }
+                }
+            }
+        ],
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "target-hlc",
+                "type": "integer"
+            },
+            {
+                "name": "target-node",
+                "type": "integer"
+            },
+            {
+                "name": "del-hlc",
+                "type": "integer"
+            },
+            {
+                "name": "del-node",
+                "type": "integer"
+            }
+        ]
+    }
+}

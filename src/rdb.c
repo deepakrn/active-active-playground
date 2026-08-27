@@ -744,6 +744,8 @@ int rdbGetObjectType(robj *o, int rdbver) {
     case OBJ_LIST:
         if (objectGetEncoding(o) == OBJ_ENCODING_QUICKLIST || objectGetEncoding(o) == OBJ_ENCODING_LISTPACK)
             return RDB_TYPE_LIST_QUICKLIST_2;
+        else if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_LIST)
+            return RDB_TYPE_LIST_CRDT;
         else
             serverPanic("Unknown list encoding");
     case OBJ_SET:
@@ -891,6 +893,58 @@ ssize_t rdbSaveStreamConsumers(rio *rdb, streamCG *cg) {
     return nwritten;
 }
 
+/* Save a CRDT List Object to RDB.
+ * Returns -1 on error, number of bytes written on success. */
+ssize_t rdbSaveCrdtListObject(rio *rdb, robj *o, robj *key) {
+    UNUSED(key);
+    crdtList *cl = objectGetVal(o);
+    ssize_t n = 0, nwritten = 0;
+
+    /* 1. Total vertices count */
+    if ((n = rdbSaveLen(rdb, cl->total_vertices)) == -1) return -1;
+    nwritten += n;
+
+    /* 2. Visible length count */
+    if ((n = rdbSaveLen(rdb, cl->length)) == -1) return -1;
+    nwritten += n;
+
+    /* 3. Vertices sequence */
+    crdtListVertex *v = cl->head->next;
+    while (v != NULL) {
+        /* id (hlc, origin_id) */
+        if ((n = rdbSaveLen(rdb, v->id.hlc)) == -1) return -1;
+        nwritten += n;
+        if ((n = rdbSaveLen(rdb, v->id.origin_id)) == -1) return -1;
+        nwritten += n;
+
+        /* parent_id (hlc, origin_id) */
+        if ((n = rdbSaveLen(rdb, v->parent_id.hlc)) == -1) return -1;
+        nwritten += n;
+        if ((n = rdbSaveLen(rdb, v->parent_id.origin_id)) == -1) return -1;
+        nwritten += n;
+
+        /* is_deleted flag */
+        if ((n = rdbSaveLen(rdb, v->deleted ? 1 : 0)) == -1) return -1;
+        nwritten += n;
+
+        if (v->deleted) {
+            /* delete_hlc, delete_origin */
+            if ((n = rdbSaveLen(rdb, v->del_hlc)) == -1) return -1;
+            nwritten += n;
+            if ((n = rdbSaveLen(rdb, v->del_origin)) == -1) return -1;
+            nwritten += n;
+        } else {
+            /* SDS string payload */
+            size_t val_len = v->val ? sdslen(v->val) : 0;
+            if ((n = rdbSaveRawString(rdb, (unsigned char *)(v->val ? v->val : ""), val_len)) == -1) return -1;
+            nwritten += n;
+        }
+
+        v = v->next;
+    }
+    return nwritten;
+}
+
 /* Save an Object.
  * Returns -1 on error, number of bytes written on success. */
 ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbtype) {
@@ -932,6 +986,9 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
             if ((n = rdbSaveLen(rdb, QUICKLIST_NODE_CONTAINER_PACKED)) == -1) return -1;
             nwritten += n;
             if ((n = rdbSaveRawString(rdb, lp, lpBytes(lp))) == -1) return -1;
+            nwritten += n;
+        } else if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_LIST) {
+            if ((n = rdbSaveCrdtListObject(rdb, o, key)) == -1) return -1;
             nwritten += n;
         } else {
             serverPanic("Unknown list encoding");
@@ -2015,6 +2072,61 @@ int lpValidateIntegrityAndDups(unsigned char *lp, size_t size, int pairs) {
     return ret;
 }
 
+/* Load a CRDT List object from RDB. */
+robj *rdbLoadCrdtListObject(rio *rdb, int rdbtype, robj *key) {
+    UNUSED(rdbtype);
+    UNUSED(key);
+    uint64_t total_vertices;
+    uint64_t visible_length;
+
+    if ((total_vertices = rdbLoadLen(rdb, NULL)) == RDB_LENERR) return NULL;
+    if ((visible_length = rdbLoadLen(rdb, NULL)) == RDB_LENERR) return NULL;
+
+    robj *o = createCrdtListObject();
+    crdtList *cl = objectGetVal(o);
+
+    for (uint64_t i = 0; i < total_vertices; i++) {
+        uint64_t hlc, origin_id, parent_hlc, parent_origin, is_del;
+        if ((hlc = rdbLoadLen(rdb, NULL)) == RDB_LENERR) goto err;
+        if ((origin_id = rdbLoadLen(rdb, NULL)) == RDB_LENERR) goto err;
+        if ((parent_hlc = rdbLoadLen(rdb, NULL)) == RDB_LENERR) goto err;
+        if ((parent_origin = rdbLoadLen(rdb, NULL)) == RDB_LENERR) goto err;
+        if ((is_del = rdbLoadLen(rdb, NULL)) == RDB_LENERR) goto err;
+
+        crdtId id = { .hlc = hlc, .origin_id = (uint32_t)origin_id };
+        crdtId parent_id = { .hlc = parent_hlc, .origin_id = (uint32_t)parent_origin };
+
+        if (is_del) {
+            uint64_t del_hlc, del_origin;
+            if ((del_hlc = rdbLoadLen(rdb, NULL)) == RDB_LENERR) goto err;
+            if ((del_origin = rdbLoadLen(rdb, NULL)) == RDB_LENERR) goto err;
+
+            crdtListVertex *v = crdtListInsertAfter(cl, parent_id, id, NULL);
+            if (!v) goto err;
+            crdtListDeleteVertex(cl, id, del_hlc, (uint32_t)del_origin);
+            if (server.active_active_enabled) {
+                hlc_recv(&server.crdt_clock, 0, id);
+                hlc_recv(&server.crdt_clock, 0, (crdtId){ .hlc = del_hlc, .origin_id = (uint32_t)del_origin });
+            }
+        } else {
+            sds val = rdbGenericLoadStringObject(rdb, RDB_LOAD_SDS, NULL);
+            if (!val) goto err;
+            crdtListVertex *v = crdtListInsertAfter(cl, parent_id, id, val);
+            sdsfree(val);
+            if (!v) goto err;
+            if (server.active_active_enabled) {
+                hlc_recv(&server.crdt_clock, 0, id);
+            }
+        }
+    }
+
+    return o;
+
+err:
+    decrRefCount(o);
+    return NULL;
+}
+
 /* Load an Object of the specified type from the specified file.
  * On success a newly allocated object is returned, otherwise NULL.
  * When the function returns NULL and if 'error' is not NULL, the
@@ -3077,6 +3189,15 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
             return NULL;
         }
         o = createModuleObject(mt, ptr);
+    } else if (rdbtype == RDB_TYPE_LIST_CRDT) {
+        robj keyobj;
+        initStaticStringObject(keyobj, key);
+        if ((o = rdbLoadCrdtListObject(rdb, rdbtype, &keyobj)) == NULL) return NULL;
+        crdtList *cl = objectGetVal(o);
+        if (cl->total_vertices == 0) {
+            decrRefCount(o);
+            goto emptykey;
+        }
     } else if (server.rdb_version_check == RDB_VERSION_CHECK_RELAXED) {
         /* Future or foreign type. Don't report it as an internal error. */
         if (error) *error = RDB_LOAD_ERR_UNKNOWN_TYPE;
@@ -3722,6 +3843,27 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
         } else {
             robj keyobj;
             initStaticStringObject(keyobj, key);
+
+            /* Non-destructive CRDT list merge when key already exists */
+            robj *existing = lookupKeyWrite(db, &keyobj);
+            if (existing && objectGetType(existing) == OBJ_LIST && objectGetEncoding(existing) == OBJ_ENCODING_CRDT_LIST &&
+                objectGetType(val) == OBJ_LIST && objectGetEncoding(val) == OBJ_ENCODING_CRDT_LIST) {
+                crdtList *local_crdt = objectGetVal(existing);
+                crdtList *remote_crdt = objectGetVal(val);
+                crdtListMerge(local_crdt, remote_crdt);
+                server.rdb_last_load_keys_loaded++;
+                if (expiretime != -1) {
+                    setExpire(NULL, db, &keyobj, expiretime);
+                }
+                objectSetLRUOrLFU(existing, lfu_freq, lru_idle);
+                moduleNotifyKeyspaceEvent(NOTIFY_LOADED, "loaded", &keyobj, db->id);
+                decrRefCount(val);
+                sdsfree(key);
+                expiretime = -1;
+                lfu_freq = -1;
+                lru_idle = -1;
+                continue;
+            }
 
             /* Add the new object in the hash table */
             int added = dbAddRDBLoad(db, key, &val);

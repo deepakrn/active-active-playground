@@ -1,0 +1,44 @@
+{
+    "CRDT.STABILITY": {
+        "summary": "Active-Active CRDT stability horizon and peer tracking command.",
+        "complexity": "O(1) or O(P) where P is the number of peer nodes.",
+        "group": "list",
+        "since": "8.0.0",
+        "arity": -1,
+        "function": "crdtStabilityCommand",
+        "command_flags": [
+            "WRITE"
+        ],
+        "acl_categories": [
+            "LIST",
+            "SLOW",
+            "WRITE"
+        ],
+        "key_specs": [
+            {
+                "flags": [
+                    "NOT_KEY"
+                ],
+                "begin_search": {
+                    "unknown": {}
+                },
+                "find_keys": {
+                    "unknown": {}
+                }
+            }
+        ],
+        "arguments": [
+            {
+                "name": "subcommand",
+                "type": "string",
+                "optional": true
+            },
+            {
+                "name": "arg",
+                "type": "string",
+                "optional": true,
+                "multiple": true
+            }
+        ]
+    }
+}

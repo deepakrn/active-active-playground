@@ -129,8 +129,10 @@ enum RdbType {
     RDB_TYPE_SET_LISTPACK = 20, /* Added in RDB 11 (7.2) */
     RDB_TYPE_STREAM_LISTPACKS_3 = 21,
     RDB_TYPE_HASH_2 = 22, /* Hash with field-level expiration, RDB 80 (9.0) */
+    RDB_TYPE_LIST_CRDT = 23, /* CRDT List */
     RDB_TYPE_LAST
 };
+#define RDB_TYPE_LIST_CRDT RDB_TYPE_LIST_CRDT
 /* NOTE: WHEN ADDING NEW RDB TYPE, UPDATE rdb_type_string[] */
 
 /* When our RDB format diverges, we need to reject types/opcodes for which we
@@ -206,8 +208,10 @@ void rdbRemoveTempFile(pid_t childpid, int from_signal);
 int rdbSaveToFile(const char *filename);
 int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags);
 ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char type);
+ssize_t rdbSaveCrdtListObject(rio *rdb, robj *o, robj *key);
 size_t rdbSavedObjectLen(robj *o, robj *key, int dbid);
 robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rdbflags, mstime_t now);
+robj *rdbLoadCrdtListObject(rio *rdb, int rdbtype, robj *key);
 void backgroundSaveDoneHandler(int exitcode, int bysignal);
 int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, int dbid, int rdbver);
 ssize_t rdbSaveSingleModuleAux(rio *rdb, int when, moduleType *mt);

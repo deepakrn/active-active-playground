@@ -524,6 +524,13 @@ robj *createListListpackObject(void) {
     return o;
 }
 
+robj *createCrdtListObject(void) {
+    crdtList *cl = crdtListCreate();
+    robj *o = createObject(OBJ_LIST, cl);
+    objectSetEncoding(o, OBJ_ENCODING_CRDT_LIST);
+    return o;
+}
+
 robj *createSetObject(void) {
     hashtable *ht = hashtableCreate(&setHashtableType);
     robj *o = createObject(OBJ_SET, ht);
@@ -595,6 +602,8 @@ void freeListObject(robj *o) {
         quicklistRelease(objectGetVal(o));
     } else if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
         lpFree(objectGetVal(o));
+    } else if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_LIST) {
+        crdtListRelease(objectGetVal(o));
     } else {
         serverPanic("Unknown list encoding type");
     }
@@ -714,6 +723,9 @@ void dismissListObject(robj *o, size_t size_hint) {
         }
     } else if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
         dismissMemory(objectGetVal(o), lpBytes((unsigned char *)objectGetVal(o)));
+    } else if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_LIST) {
+        /* No contiguous single buffer to dismiss for CRDT list */
+        return;
     } else {
         serverPanic("Unknown list encoding type");
     }
@@ -1206,6 +1218,7 @@ char *strEncoding(int encoding) {
     case OBJ_ENCODING_BTREE: return "btree";
     case OBJ_ENCODING_EMBSTR: return "embstr";
     case OBJ_ENCODING_STREAM: return "stream";
+    case OBJ_ENCODING_CRDT_LIST: return "crdt_list";
     default: return "unknown";
     }
 }

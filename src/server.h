@@ -79,6 +79,9 @@
                            N-elements flat arrays */
 #include "expire.h"     /* Expiration public API */
 #include "rax.h"        /* Radix tree */
+#include "crdt_clock.h" /* CRDT Hybrid Logical Clock Engine */
+#include "crdt_list.h"  /* CRDT Replicated Growable Array (RGA) List Engine */
+#include "crdt_gc.h"    /* CRDT Anti-Entropy & Tombstone GC Subsystem */
 #include "connection.h" /* Connection abstraction */
 #include "memory_prefetch.h"
 #include "vset.h"
@@ -782,6 +785,7 @@ typedef struct ValkeyModuleType moduleType;
 #define OBJ_ENCODING_QUICKLIST 9  /* Encoded as linked list of listpacks */
 #define OBJ_ENCODING_STREAM 10    /* Encoded as a radix tree of listpacks */
 #define OBJ_ENCODING_LISTPACK 11  /* Encoded as a listpack */
+#define OBJ_ENCODING_CRDT_LIST 15 /* Encoded as CRDT RGA List */
 
 #define OBJ_REFCOUNT_BITS 29
 #define OBJ_SHARED_REFCOUNT ((1 << OBJ_REFCOUNT_BITS) - 1) /* Global object never destroyed. */
@@ -2205,6 +2209,15 @@ struct valkeyServer {
     int repl_ignore_disk_write_error;     /* Configures whether replicas panic when unable to
                                            * persist writes to AOF. */
 
+    /* Active-Active CRDT Configuration */
+    int active_active_enabled;            /* Active-Active CRDT mode enabled */
+    uint32_t origin_id;                   /* Active-Active Origin Node ID */
+    size_t peer_aa_buffer_limit;          /* Max buffer limit for peer AA replication */
+    crdtClockState crdt_clock;            /* CRDT Hybrid Logical Clock state */
+    mstime_t aa_gc_lease_ms;              /* Lease timeout for peer GC quorum eviction (ms) */
+    dict *crdt_peers;                     /* Map of peer_node_id -> crdtPeerState* */
+    crdtGcStats crdt_gc_stats;            /* Tombstone garbage collection statistics */
+
     /* The following two fields is where we store primary PSYNC replid/offset
      * while the PSYNC is in progress. At the end we'll copy the fields into
      * the server->primary client structure. */
@@ -2781,15 +2794,17 @@ typedef struct {
     unsigned char encoding;
     unsigned char direction; /* Iteration direction */
 
-    unsigned char *lpi;  /* listpack iterator */
-    quicklistIter *iter; /* quicklist iterator */
+    unsigned char *lpi;        /* listpack iterator */
+    quicklistIter *iter;       /* quicklist iterator */
+    crdtListVertex *crdt_curr; /* CRDT list iterator cursor */
 } listTypeIterator;
 
 /* Structure for an entry while iterating over a list. */
 typedef struct {
     listTypeIterator *li;
-    unsigned char *lpe;   /* Entry in listpack */
-    quicklistEntry entry; /* Entry in quicklist */
+    unsigned char *lpe;         /* Entry in listpack */
+    quicklistEntry entry;       /* Entry in quicklist */
+    crdtListVertex *crdt_entry; /* Entry in CRDT list */
 } listTypeEntry;
 
 /* Structure to hold set iteration abstraction. */
@@ -3179,6 +3194,8 @@ robj *createStringObjectFromLongLongWithSds(long long value);
 robj *createStringObjectFromLongDouble(long double value, int humanfriendly);
 robj *createQuicklistObject(int fill, int compress);
 robj *createListListpackObject(void);
+robj *createCrdtListObject(void);
+void listTypeConvertToCrdt(robj *o);
 robj *createSetObject(void);
 robj *createIntsetObject(void);
 robj *createSetListpackObject(void);
@@ -4034,6 +4051,12 @@ void lrangeCommand(client *c);
 void ltrimCommand(client *c);
 void typeCommand(client *c);
 void lsetCommand(client *c);
+void crdtLInsertCommand(client *c);
+void crdtLDeleteCommand(client *c);
+void crdtGcCommand(client *c);
+void crdtStabilityCommand(client *c);
+void crdtPropagateInsert(client *c, robj *key, crdtId parent_id, crdtId new_id, sds val);
+void crdtPropagateDelete(client *c, robj *key, crdtId target_id, uint64_t del_hlc, uint32_t del_origin);
 void saddCommand(client *c);
 void sremCommand(client *c);
 void smoveCommand(client *c);

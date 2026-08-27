@@ -1,0 +1,43 @@
+{
+    "CRDT.GC": {
+        "summary": "Active-Active CRDT garbage collection sweep command.",
+        "complexity": "O(N) where N is the number of keys or vertices traversed.",
+        "group": "list",
+        "since": "8.0.0",
+        "arity": -1,
+        "function": "crdtGcCommand",
+        "command_flags": [
+            "WRITE"
+        ],
+        "acl_categories": [
+            "LIST",
+            "SLOW",
+            "WRITE"
+        ],
+        "key_specs": [
+            {
+                "flags": [
+                    "NOT_KEY"
+                ],
+                "begin_search": {
+                    "unknown": {}
+                },
+                "find_keys": {
+                    "unknown": {}
+                }
+            }
+        ],
+        "arguments": [
+            {
+                "name": "target",
+                "type": "string",
+                "optional": true
+            },
+            {
+                "name": "h-stable",
+                "type": "integer",
+                "optional": true
+            }
+        ]
+    }
+}

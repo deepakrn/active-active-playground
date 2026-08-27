@@ -498,6 +498,9 @@ ENGINE_SERVER_OBJ = \
     crc64.o \
     crccombine.o \
     crcspeed.o \
+    crdt_clock.o \
+    crdt_list.o \
+    crdt_gc.o \
     db.o \
     debug.o \
     defrag.o \
@@ -830,6 +833,12 @@ lcov:
 
 bench: $(ENGINE_BENCHMARK_NAME)
 	./$(ENGINE_BENCHMARK_NAME)
+
+crdt_list_test: crdt_clock.o crdt_list.o rax.o sds.o zmalloc.o monotonic.o
+	$(QUIET_LINK)$(CC) $(FINAL_CFLAGS) -I. -o ../tests/unit/crdt_list_test ../tests/unit/crdt_list_test.c crdt_clock.o crdt_list.o rax.o sds.o zmalloc.o monotonic.o $(FINAL_LIBS)
+
+test-crdt: crdt_list_test
+	../tests/unit/crdt_list_test
 
 32bit:
 	@echo ""

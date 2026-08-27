@@ -3402,6 +3402,7 @@ standardConfig static_configs[] = {
     createBoolConfig("lua-enable-insecure-api", "lua-enable-deprecated-api", MODIFIABLE_CONFIG | HIDDEN_CONFIG | PROTECTED_CONFIG, server.lua_enable_insecure_api, 0, NULL, updateLuaEnableInsecureApi),
     createBoolConfig("import-mode", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.import_mode, 0, NULL, NULL),
     createBoolConfig("io-threads-always-active", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_always_active, 0, NULL, NULL),
+    createBoolConfig("active-active", NULL, MODIFIABLE_CONFIG, server.active_active_enabled, 0, NULL, NULL),
 
     /* String Configs */
     createStringConfig("aclfile", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.acl_filename, "", NULL, NULL),
@@ -3525,8 +3526,11 @@ standardConfig static_configs[] = {
     createUIntConfig("client-default-resp", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, 2, 3, server.client_default_resp, 2, INTEGER_CONFIG, NULL, NULL),
 #endif
     createUIntConfig("cluster-replica-priority", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.cluster_replica_priority, 0, INTEGER_CONFIG, NULL, updateClusterReplicaPriority),
+    createUIntConfig("active-active-origin-id", NULL, MODIFIABLE_CONFIG, 1, UINT_MAX, server.origin_id, 1, INTEGER_CONFIG, NULL, NULL),
 
     /* Unsigned Long configs */
+    createULongConfig("active-active-peer-buffer-limit", "peer-aa-buffer-limit", MODIFIABLE_CONFIG, 0, ULONG_MAX, server.peer_aa_buffer_limit, 64 * 1024 * 1024, MEMORY_CONFIG, NULL, NULL),
+    createLongLongConfig("active-active-gc-lease-ms", "active-active-gc-lease", MODIFIABLE_CONFIG, 0, LLONG_MAX, server.aa_gc_lease_ms, 3600000, INTEGER_CONFIG, NULL, NULL),
     createULongConfig("active-defrag-max-scan-fields", NULL, MODIFIABLE_CONFIG, 1, LONG_MAX, server.active_defrag_max_scan_fields, 1000, INTEGER_CONFIG, NULL, NULL), /* Default: keys with more than 1000 fields will be processed separately */
     createULongConfig("commandlog-slow-execution-max-len", "slowlog-max-len", MODIFIABLE_CONFIG, 0, LONG_MAX, server.commandlog[COMMANDLOG_TYPE_SLOW].max_len, 128, INTEGER_CONFIG, NULL, NULL),
     createULongConfig("commandlog-large-request-max-len", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.commandlog[COMMANDLOG_TYPE_LARGE_REQUEST].max_len, 128, INTEGER_CONFIG, NULL, NULL),

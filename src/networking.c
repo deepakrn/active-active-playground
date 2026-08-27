@@ -6263,6 +6263,15 @@ int checkClientOutputBufferLimits(client *c) {
     if (server.client_obuf_limits[class].hard_limit_bytes && used_mem >= hard_limit_bytes) hard = 1;
     if (server.client_obuf_limits[class].soft_limit_bytes && used_mem >= soft_limit_bytes) soft = 1;
 
+    /* Active-Active CRDT bounded peer replication buffer limit */
+    if (server.peer_aa_buffer_limit > 0 && class == CLIENT_TYPE_REPLICA) {
+        if (used_mem >= server.peer_aa_buffer_limit) {
+            serverLog(LL_NOTICE, "Peer replication buffer limit exceeded (%lu >= %zu). Disconnecting peer.",
+                      used_mem, server.peer_aa_buffer_limit);
+            hard = 1;
+        }
+    }
+
     /* We need to check if the soft limit is reached continuously for the
      * specified amount of seconds. */
     if (soft) {

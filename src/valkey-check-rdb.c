@@ -165,6 +165,7 @@ char *rdb_type_string[] = {
     "set-listpack",
     "stream-v3",
     "hash-volatile-items",
+    "list-crdt",
 };
 
 static_assert(sizeof(rdb_type_string) / sizeof(rdb_type_string[0]) == RDB_TYPE_LAST, "Mismatch between enum and string table");

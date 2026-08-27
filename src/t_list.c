@@ -108,6 +108,35 @@ static void listTypeTryConvertQuicklist(robj *o, int shrinking, beforeConvertCB 
     o->encoding = OBJ_ENCODING_LISTPACK;
 }
 
+void listTypeConvertToCrdt(robj *o) {
+    if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_LIST) return;
+    crdtList *cl = crdtListCreate();
+    listTypeIterator *li = listTypeInitIterator(o, 0, LIST_TAIL);
+    listTypeEntry entry;
+    while (listTypeNext(li, &entry)) {
+        size_t vlen = 0;
+        long long lval = 0;
+        unsigned char *vstr = listTypeGetValue(&entry, &vlen, &lval);
+        sds s;
+        if (vstr) {
+            s = sdsnewlen(vstr, vlen);
+        } else {
+            s = sdsfromlonglong(lval);
+        }
+        crdtListPushTail(cl, &server.crdt_clock, s);
+        sdsfree(s);
+    }
+    listTypeReleaseIterator(li);
+
+    if (objectGetEncoding(o) == OBJ_ENCODING_QUICKLIST) {
+        quicklistRelease(objectGetVal(o));
+    } else if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
+        lpFree(objectGetVal(o));
+    }
+    objectSetVal(o, cl);
+    objectSetEncoding(o, OBJ_ENCODING_CRDT_LIST);
+}
+
 /* Check if the list needs to be converted to appropriate encoding due to
  * growing, shrinking or other cases.
  *
@@ -125,7 +154,9 @@ static void listTypeTryConvertQuicklist(robj *o, int shrinking, beforeConvertCB 
  *                       order to avoid repeated conversions on every list change. */
 static void
 listTypeTryConversionRaw(robj *o, list_conv_type lct, robj **argv, int start, int end, beforeConvertCB fn, void *data) {
-    if (objectGetEncoding(o) == OBJ_ENCODING_QUICKLIST) {
+    if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_LIST) {
+        return;
+    } else if (objectGetEncoding(o) == OBJ_ENCODING_QUICKLIST) {
         if (lct == LIST_CONV_GROWING) return; /* Growing has nothing to do with quicklist */
         listTypeTryConvertQuicklist(o, lct == LIST_CONV_SHRINKING, fn, data);
     } else if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
@@ -173,6 +204,16 @@ void listTypePush(robj *subject, robj *value, int where) {
                                            : lpAppend(objectGetVal(subject), objectGetVal(value), sdslen(objectGetVal(value)));
         }
         objectSetVal(subject, new_val);
+    } else if (subject->encoding == OBJ_ENCODING_CRDT_LIST) {
+        crdtList *cl = objectGetVal(subject);
+        robj *valobj = getDecodedObject(value);
+        sds str = objectGetVal(valobj);
+        if (where == LIST_HEAD) {
+            crdtListPushHead(cl, &server.crdt_clock, str);
+        } else {
+            crdtListPushTail(cl, &server.crdt_clock, str);
+        }
+        decrRefCount(valobj);
     } else {
         serverPanic("Unknown list encoding");
     }
@@ -203,6 +244,14 @@ robj *listTypePop(robj *subject, int where) {
             value = createStringObject((char *)vstr, vlen);
             objectSetVal(subject, lpDelete(objectGetVal(subject), p, NULL));
         }
+    } else if (subject->encoding == OBJ_ENCODING_CRDT_LIST) {
+        crdtList *cl = objectGetVal(subject);
+        sds out_val = NULL;
+        int ok = (where == LIST_HEAD) ? crdtListPopHead(cl, &server.crdt_clock, &out_val)
+                                      : crdtListPopTail(cl, &server.crdt_clock, &out_val);
+        if (ok && out_val) {
+            value = createObject(OBJ_STRING, out_val);
+        }
     } else {
         serverPanic("Unknown list encoding");
     }
@@ -214,6 +263,8 @@ unsigned long listTypeLength(const robj *subject) {
         return quicklistCount(objectGetVal(subject));
     } else if (subject->encoding == OBJ_ENCODING_LISTPACK) {
         return lpLength(objectGetVal(subject));
+    } else if (subject->encoding == OBJ_ENCODING_CRDT_LIST) {
+        return crdtListLength(objectGetVal(subject));
     } else {
         serverPanic("Unknown list encoding");
     }
@@ -226,6 +277,8 @@ listTypeIterator *listTypeInitIterator(robj *subject, long index, unsigned char 
     li->encoding = subject->encoding;
     li->direction = direction;
     li->iter = NULL;
+    li->lpi = NULL;
+    li->crdt_curr = NULL;
     /* LIST_HEAD means start at TAIL and move *towards* head.
      * LIST_TAIL means start at HEAD and move *towards* tail. */
     if (li->encoding == OBJ_ENCODING_QUICKLIST) {
@@ -233,6 +286,9 @@ listTypeIterator *listTypeInitIterator(robj *subject, long index, unsigned char 
         li->iter = quicklistGetIteratorAtIdx(objectGetVal(li->subject), iter_direction, index);
     } else if (li->encoding == OBJ_ENCODING_LISTPACK) {
         li->lpi = lpSeek(objectGetVal(subject), index);
+    } else if (li->encoding == OBJ_ENCODING_CRDT_LIST) {
+        crdtList *cl = objectGetVal(subject);
+        li->crdt_curr = crdtListGetVisibleIndex(cl, index);
     } else {
         serverPanic("Unknown list encoding");
     }
@@ -252,6 +308,19 @@ void listTypeSetIteratorDirection(listTypeIterator *li, listTypeEntry *entry, un
         /* Note that the iterator for listpack always points to the next of the current entry,
          * so we need to update position of the iterator depending on the direction. */
         li->lpi = (direction == LIST_TAIL) ? lpNext(lp, entry->lpe) : lpPrev(lp, entry->lpe);
+    } else if (li->encoding == OBJ_ENCODING_CRDT_LIST) {
+        crdtList *cl = objectGetVal(li->subject);
+        crdtListVertex *curr = entry->crdt_entry;
+        if (curr != NULL) {
+            if (direction == LIST_TAIL) {
+                curr = curr->next;
+                while (curr != NULL && curr->deleted) curr = curr->next;
+            } else {
+                curr = curr->prev;
+                while (curr != NULL && (curr->deleted || curr == cl->head)) curr = curr->prev;
+            }
+        }
+        li->crdt_curr = curr;
     } else {
         serverPanic("Unknown list encoding");
     }
@@ -280,6 +349,21 @@ int listTypeNext(listTypeIterator *li, listTypeEntry *entry) {
                 (li->direction == LIST_TAIL) ? lpNext(objectGetVal(li->subject), li->lpi) : lpPrev(objectGetVal(li->subject), li->lpi);
             return 1;
         }
+    } else if (li->encoding == OBJ_ENCODING_CRDT_LIST) {
+        crdtList *cl = objectGetVal(li->subject);
+        if (li->crdt_curr != NULL && !li->crdt_curr->deleted && li->crdt_curr != cl->head) {
+            entry->crdt_entry = li->crdt_curr;
+            crdtListVertex *p = li->crdt_curr;
+            if (li->direction == LIST_TAIL) {
+                p = p->next;
+                while (p != NULL && p->deleted) p = p->next;
+            } else {
+                p = p->prev;
+                while (p != NULL && (p->deleted || p == cl->head)) p = p->prev;
+            }
+            li->crdt_curr = p;
+            return 1;
+        }
     } else {
         serverPanic("Unknown list encoding");
     }
@@ -303,6 +387,11 @@ unsigned char *listTypeGetValue(listTypeEntry *entry, size_t *vlen, long long *l
         unsigned int slen;
         vstr = lpGetValue(entry->lpe, &slen, lval);
         *vlen = slen;
+    } else if (entry->li->encoding == OBJ_ENCODING_CRDT_LIST) {
+        if (entry->crdt_entry && entry->crdt_entry->val) {
+            vstr = (unsigned char *)entry->crdt_entry->val;
+            *vlen = sdslen(entry->crdt_entry->val);
+        }
     } else {
         serverPanic("Unknown list encoding");
     }
@@ -312,8 +401,8 @@ unsigned char *listTypeGetValue(listTypeEntry *entry, size_t *vlen, long long *l
 /* Return entry or NULL at the current position of the iterator. */
 robj *listTypeGet(listTypeEntry *entry) {
     unsigned char *vstr;
-    size_t vlen;
-    long long lval;
+    size_t vlen = 0;
+    long long lval = 0;
 
     vstr = listTypeGetValue(entry, &vlen, &lval);
     if (vstr)
@@ -337,6 +426,17 @@ void listTypeInsert(listTypeEntry *entry, robj *value, int where) {
     } else if (entry->li->encoding == OBJ_ENCODING_LISTPACK) {
         int lpw = (where == LIST_TAIL) ? LP_AFTER : LP_BEFORE;
         objectSetVal(subject, lpInsertString(objectGetVal(subject), (unsigned char *)str, len, entry->lpe, lpw, &entry->lpe));
+    } else if (entry->li->encoding == OBJ_ENCODING_CRDT_LIST) {
+        crdtList *cl = objectGetVal(subject);
+        crdtId parent_id;
+        if (where == LIST_TAIL) {
+            parent_id = entry->crdt_entry->id;
+        } else {
+            parent_id = entry->crdt_entry->prev ? entry->crdt_entry->prev->id : (crdtId){0, 0};
+        }
+        crdtId new_id;
+        hlc_now(&server.crdt_clock, 0, &new_id, NULL);
+        crdtListInsertAfter(cl, parent_id, new_id, str);
     } else {
         serverPanic("Unknown list encoding");
     }
@@ -354,6 +454,18 @@ void listTypeReplace(listTypeEntry *entry, robj *value) {
         quicklistReplaceEntry(entry->li->iter, &entry->entry, str, len);
     } else if (entry->li->encoding == OBJ_ENCODING_LISTPACK) {
         objectSetVal(subject, lpReplace(objectGetVal(subject), &entry->lpe, (unsigned char *)str, len));
+    } else if (entry->li->encoding == OBJ_ENCODING_CRDT_LIST) {
+        crdtList *cl = objectGetVal(subject);
+        crdtListVertex *v = entry->crdt_entry;
+        if (v) {
+            crdtId del_id;
+            hlc_now(&server.crdt_clock, 0, &del_id, NULL);
+            crdtId parent_id = v->prev ? v->prev->id : (crdtId){0, 0};
+            crdtListDeleteVertex(cl, v->id, del_id.hlc, server.crdt_clock.origin_id);
+            crdtId new_id;
+            hlc_now(&server.crdt_clock, 0, &new_id, NULL);
+            crdtListInsertAfter(cl, parent_id, new_id, str);
+        }
     } else {
         serverPanic("Unknown list encoding");
     }
@@ -380,6 +492,19 @@ int listTypeReplaceAtIndex(robj *o, int index, robj *value) {
             objectSetVal(o, lpReplace(objectGetVal(o), &p, (unsigned char *)vstr, vlen));
             replaced = 1;
         }
+    } else if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_LIST) {
+        crdtList *cl = objectGetVal(o);
+        crdtListVertex *v = crdtListGetVisibleIndex(cl, index);
+        if (v) {
+            crdtId del_id;
+            hlc_now(&server.crdt_clock, 0, &del_id, NULL);
+            crdtId parent_id = v->prev ? v->prev->id : (crdtId){0, 0};
+            crdtListDeleteVertex(cl, v->id, del_id.hlc, server.crdt_clock.origin_id);
+            crdtId new_id;
+            hlc_now(&server.crdt_clock, 0, &new_id, NULL);
+            crdtListInsertAfter(cl, parent_id, new_id, vstr);
+            replaced = 1;
+        }
     } else {
         serverPanic("Unknown list encoding");
     }
@@ -395,6 +520,11 @@ int listTypeEqual(listTypeEntry *entry, robj *o) {
         return quicklistCompare(&entry->entry, objectGetVal(o), sdslen(objectGetVal(o)));
     } else if (entry->li->encoding == OBJ_ENCODING_LISTPACK) {
         return lpCompare(entry->lpe, objectGetVal(o), sdslen(objectGetVal(o)));
+    } else if (entry->li->encoding == OBJ_ENCODING_CRDT_LIST) {
+        sds target = objectGetVal(o);
+        if (!entry->crdt_entry || !entry->crdt_entry->val) return 0;
+        return (sdslen(entry->crdt_entry->val) == sdslen(target) &&
+                memcmp(entry->crdt_entry->val, target, sdslen(target)) == 0);
     } else {
         serverPanic("Unknown list encoding");
     }
@@ -420,6 +550,13 @@ void listTypeDelete(listTypeIterator *iter, listTypeEntry *entry) {
                 iter->lpi = lpLast(objectGetVal(iter->subject));
             }
         }
+    } else if (entry->li->encoding == OBJ_ENCODING_CRDT_LIST) {
+        crdtList *cl = objectGetVal(iter->subject);
+        if (entry->crdt_entry) {
+            crdtId del_id;
+            hlc_now(&server.crdt_clock, 0, &del_id, NULL);
+            crdtListDeleteVertex(cl, entry->crdt_entry->id, del_id.hlc, server.crdt_clock.origin_id);
+        }
     } else {
         serverPanic("Unknown list encoding");
     }
@@ -438,6 +575,7 @@ robj *listTypeDup(robj *o) {
     switch (o->encoding) {
     case OBJ_ENCODING_LISTPACK: lobj = createObject(OBJ_LIST, lpDup(objectGetVal(o))); break;
     case OBJ_ENCODING_QUICKLIST: lobj = createObject(OBJ_LIST, quicklistDup(objectGetVal(o))); break;
+    case OBJ_ENCODING_CRDT_LIST: lobj = createObject(OBJ_LIST, crdtListClone(objectGetVal(o))); break;
     default: serverPanic("Unknown list encoding"); break;
     }
     lobj->encoding = o->encoding;
@@ -450,6 +588,19 @@ void listTypeDelRange(robj *subject, long start, long count) {
         quicklistDelRange(objectGetVal(subject), start, count);
     } else if (subject->encoding == OBJ_ENCODING_LISTPACK) {
         objectSetVal(subject, lpDeleteRange(objectGetVal(subject), start, count));
+    } else if (subject->encoding == OBJ_ENCODING_CRDT_LIST) {
+        crdtList *cl = objectGetVal(subject);
+        if (start < 0) start = (long)cl->length + start;
+        if (start < 0) start = 0;
+        long deleted = 0;
+        while (deleted < count && cl->length > 0) {
+            crdtListVertex *v = crdtListGetVisibleIndex(cl, start);
+            if (!v) break;
+            crdtId del_id;
+            hlc_now(&server.crdt_clock, 0, &del_id, NULL);
+            crdtListDeleteVertex(cl, v->id, del_id.hlc, server.crdt_clock.origin_id);
+            deleted++;
+        }
     } else {
         serverPanic("Unknown list encoding");
     }
@@ -472,13 +623,38 @@ void pushGenericCommand(client *c, int where, int xx) {
             return;
         }
 
-        lobj = createListListpackObject();
+        if (server.active_active_enabled) {
+            lobj = createCrdtListObject();
+        } else {
+            lobj = createListListpackObject();
+        }
         dbAdd(c->db, c->argv[1], &lobj);
+    } else if (server.active_active_enabled && objectGetEncoding(lobj) != OBJ_ENCODING_CRDT_LIST) {
+        listTypeConvertToCrdt(lobj);
     }
 
-    listTypeTryConversionAppend(lobj, c->argv, 2, c->argc - 1, NULL, NULL);
+    if (objectGetEncoding(lobj) != OBJ_ENCODING_CRDT_LIST) {
+        listTypeTryConversionAppend(lobj, c->argv, 2, c->argc - 1, NULL, NULL);
+    }
+
     for (j = 2; j < c->argc; j++) {
-        listTypePush(lobj, c->argv[j], where);
+        if (objectGetEncoding(lobj) == OBJ_ENCODING_CRDT_LIST) {
+            crdtList *cl = objectGetVal(lobj);
+            robj *valobj = getDecodedObject(c->argv[j]);
+            sds val = objectGetVal(valobj);
+            crdtListVertex *v;
+            if (where == LIST_HEAD) {
+                v = crdtListPushHead(cl, &server.crdt_clock, val);
+            } else {
+                v = crdtListPushTail(cl, &server.crdt_clock, val);
+            }
+            if (server.active_active_enabled && v != NULL) {
+                crdtPropagateInsert(c, c->argv[1], v->parent_id, v->id, v->val);
+            }
+            decrRefCount(valobj);
+        } else {
+            listTypePush(lobj, c->argv[j], where);
+        }
         server.dirty++;
     }
 
@@ -529,18 +705,44 @@ void linsertCommand(client *c) {
     if ((subject = lookupKeyWriteOrReply(c, c->argv[1], shared.czero)) == NULL || checkType(c, subject, OBJ_LIST))
         return;
 
-    /* We're not sure if this value can be inserted yet, but we cannot
-     * convert the list inside the iterator. We don't want to loop over
-     * the list twice (once to see if the value can be inserted and once
-     * to do the actual insert), so we assume this value can be inserted
-     * and convert the listpack to a regular list if necessary. */
-    listTypeTryConversionAppend(subject, c->argv, 4, 4, NULL, NULL);
+    if (server.active_active_enabled && objectGetEncoding(subject) != OBJ_ENCODING_CRDT_LIST) {
+        listTypeConvertToCrdt(subject);
+    }
+
+    if (objectGetEncoding(subject) != OBJ_ENCODING_CRDT_LIST) {
+        /* We're not sure if this value can be inserted yet, but we cannot
+         * convert the list inside the iterator. We don't want to loop over
+         * the list twice (once to see if the value can be inserted and once
+         * to do the actual insert), so we assume this value can be inserted
+         * and convert the listpack to a regular list if necessary. */
+        listTypeTryConversionAppend(subject, c->argv, 4, 4, NULL, NULL);
+    }
 
     /* Seek pivot from head to tail */
     iter = listTypeInitIterator(subject, 0, LIST_TAIL);
     while (listTypeNext(iter, &entry)) {
         if (listTypeEqual(&entry, c->argv[3])) {
-            listTypeInsert(&entry, c->argv[4], where);
+            if (objectGetEncoding(subject) == OBJ_ENCODING_CRDT_LIST) {
+                crdtList *cl = objectGetVal(subject);
+                crdtListVertex *pivot_v = entry.crdt_entry;
+                crdtId parent_id;
+                if (where == LIST_TAIL) {
+                    parent_id = pivot_v->id;
+                } else {
+                    parent_id = pivot_v->prev ? pivot_v->prev->id : (crdtId){0, 0};
+                }
+                crdtId new_id;
+                hlc_now(&server.crdt_clock, 0, &new_id, NULL);
+                robj *valobj = getDecodedObject(c->argv[4]);
+                sds val = objectGetVal(valobj);
+                crdtListVertex *v = crdtListInsertAfter(cl, parent_id, new_id, val);
+                if (server.active_active_enabled && v != NULL) {
+                    crdtPropagateInsert(c, c->argv[1], parent_id, new_id, val);
+                }
+                decrRefCount(valobj);
+            } else {
+                listTypeInsert(&entry, c->argv[4], where);
+            }
             inserted = 1;
             break;
         }
@@ -603,6 +805,41 @@ void lsetCommand(client *c) {
     robj *value = c->argv[3];
 
     if ((getLongFromObjectOrReply(c, c->argv[2], &index, NULL) != C_OK)) return;
+
+    if (server.active_active_enabled && objectGetEncoding(o) != OBJ_ENCODING_CRDT_LIST) {
+        listTypeConvertToCrdt(o);
+    }
+
+    if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_LIST) {
+        crdtList *cl = objectGetVal(o);
+        crdtListVertex *v = crdtListGetVisibleIndex(cl, index);
+        if (v == NULL) {
+            addReplyErrorObject(c, shared.outofrangeerr);
+            return;
+        }
+        crdtId del_id;
+        hlc_now(&server.crdt_clock, 0, &del_id, NULL);
+        crdtId target_id = v->id;
+        crdtId parent_id = v->prev ? v->prev->id : (crdtId){0, 0};
+        crdtListDeleteVertex(cl, target_id, del_id.hlc, server.crdt_clock.origin_id);
+        if (server.active_active_enabled) {
+            crdtPropagateDelete(c, c->argv[1], target_id, del_id.hlc, server.crdt_clock.origin_id);
+        }
+        crdtId new_id;
+        hlc_now(&server.crdt_clock, 0, &new_id, NULL);
+        robj *valobj = getDecodedObject(value);
+        sds val = objectGetVal(valobj);
+        crdtListVertex *new_v = crdtListInsertAfter(cl, parent_id, new_id, val);
+        if (server.active_active_enabled && new_v != NULL) {
+            crdtPropagateInsert(c, c->argv[1], parent_id, new_id, val);
+        }
+        decrRefCount(valobj);
+        signalModifiedKey(c, c->db, c->argv[1]);
+        notifyKeyspaceEvent(NOTIFY_LIST, "lset", c->argv[1], c->db->id);
+        server.dirty++;
+        addReply(c, shared.ok);
+        return;
+    }
 
     listTypeTryConversionAppend(o, c->argv, 3, 3, NULL, NULL);
     if (listTypeReplaceAtIndex(o, index, value)) {
@@ -698,6 +935,26 @@ void addListListpackRangeReply(client *c, robj *o, int from, int rangelen, int r
     }
 }
 
+/* Extracted from `addListRangeReply()` to reply with a CRDT list. */
+void addListCrdtRangeReply(client *c, robj *o, long start, long end, int reverse) {
+    writePreparedClient *wpc = prepareClientForFutureWrites(c);
+    if (!wpc) return;
+    crdtList *cl = objectGetVal(o);
+    size_t out_len = 0;
+    sds *items = crdtListGetVisibleRange(cl, start, end, &out_len);
+    addWritePreparedReplyArrayLen(wpc, out_len);
+    if (reverse) {
+        for (long i = (long)out_len - 1; i >= 0; i--) {
+            addWritePreparedReplyBulkCBuffer(wpc, items[i], sdslen(items[i]));
+        }
+    } else {
+        for (size_t i = 0; i < out_len; i++) {
+            addWritePreparedReplyBulkCBuffer(wpc, items[i], sdslen(items[i]));
+        }
+    }
+    crdtListFreeRange(items, out_len);
+}
+
 /* A helper for replying with a list's range between the inclusive start and end
  * indexes as multi-bulk, with support for negative indexes. Note that start
  * must be less than end or an empty array is returned. When the reverse
@@ -725,6 +982,8 @@ void addListRangeReply(client *c, robj *o, long start, long end, int reverse) {
         addListQuicklistRangeReply(c, o, from, rangelen, reverse);
     else if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK)
         addListListpackRangeReply(c, o, from, rangelen, reverse);
+    else if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_LIST)
+        addListCrdtRangeReply(c, o, start, end, reverse);
     else
         serverPanic("Unknown list encoding");
 }
@@ -773,6 +1032,66 @@ void popGenericCommand(client *c, int where) {
     if (hascount && !count) {
         /* Fast exit path. */
         addReply(c, shared.emptyarray);
+        return;
+    }
+
+    if (server.active_active_enabled && objectGetEncoding(o) != OBJ_ENCODING_CRDT_LIST) {
+        listTypeConvertToCrdt(o);
+    }
+
+    if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_LIST) {
+        crdtList *cl = objectGetVal(o);
+        long llen = listTypeLength(o);
+        if (llen == 0) {
+            if (hascount)
+                addReply(c, shared.nullarray[c->resp]);
+            else
+                addReply(c, shared.null[c->resp]);
+            return;
+        }
+
+        if (!count) {
+            long idx = (where == LIST_HEAD) ? 0 : -1;
+            crdtListVertex *v = crdtListGetVisibleIndex(cl, idx);
+            if (!v) {
+                addReply(c, shared.null[c->resp]);
+                return;
+            }
+            crdtId del_id;
+            hlc_now(&server.crdt_clock, 0, &del_id, NULL);
+            crdtId target_id = v->id;
+            sds val_sds = sdsdup(v->val);
+            crdtListDeleteVertex(cl, target_id, del_id.hlc, server.crdt_clock.origin_id);
+            if (server.active_active_enabled) {
+                crdtPropagateDelete(c, c->argv[1], target_id, del_id.hlc, server.crdt_clock.origin_id);
+            }
+            value = createObject(OBJ_STRING, val_sds);
+            listElementsRemoved(c, c->argv[1], where, o, 1, NULL);
+            addReplyBulk(c, value);
+            decrRefCount(value);
+        } else {
+            long rangelen = (count > llen) ? llen : count;
+            long rangestart = (where == LIST_HEAD) ? 0 : -rangelen;
+            long rangeend = (where == LIST_HEAD) ? rangelen - 1 : -1;
+            int reverse = (where == LIST_HEAD) ? 0 : 1;
+
+            initDeferredReplyBuffer(c);
+            addListRangeReply(c, o, rangestart, rangeend, reverse);
+            for (long i = 0; i < rangelen; i++) {
+                long idx = (where == LIST_HEAD) ? 0 : -1;
+                crdtListVertex *v = crdtListGetVisibleIndex(cl, idx);
+                if (!v) break;
+                crdtId del_id;
+                hlc_now(&server.crdt_clock, 0, &del_id, NULL);
+                crdtId target_id = v->id;
+                crdtListDeleteVertex(cl, target_id, del_id.hlc, server.crdt_clock.origin_id);
+                if (server.active_active_enabled) {
+                    crdtPropagateDelete(c, c->argv[1], target_id, del_id.hlc, server.crdt_clock.origin_id);
+                }
+            }
+            listElementsRemoved(c, c->argv[1], where, o, rangelen, NULL);
+            commitDeferredReplyBuffer(c, 1);
+        }
         return;
     }
 
@@ -874,6 +1193,11 @@ void ltrimCommand(client *c) {
         return;
 
     if ((o = lookupKeyWriteOrReply(c, c->argv[1], shared.ok)) == NULL || checkType(c, o, OBJ_LIST)) return;
+
+    if (server.active_active_enabled && objectGetEncoding(o) != OBJ_ENCODING_CRDT_LIST) {
+        listTypeConvertToCrdt(o);
+    }
+
     llen = listTypeLength(o);
 
     /* convert negative indexes */
@@ -900,6 +1224,30 @@ void ltrimCommand(client *c) {
     } else if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
         objectSetVal(o, lpDeleteRange(objectGetVal(o), 0, ltrim));
         objectSetVal(o, lpDeleteRange(objectGetVal(o), -rtrim, rtrim));
+    } else if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_LIST) {
+        crdtList *cl = objectGetVal(o);
+        for (long i = 0; i < ltrim; i++) {
+            crdtListVertex *v = crdtListGetVisibleIndex(cl, 0);
+            if (!v) break;
+            crdtId del_id;
+            hlc_now(&server.crdt_clock, 0, &del_id, NULL);
+            crdtId target_id = v->id;
+            crdtListDeleteVertex(cl, target_id, del_id.hlc, server.crdt_clock.origin_id);
+            if (server.active_active_enabled) {
+                crdtPropagateDelete(c, c->argv[1], target_id, del_id.hlc, server.crdt_clock.origin_id);
+            }
+        }
+        for (long i = 0; i < rtrim; i++) {
+            crdtListVertex *v = crdtListGetVisibleIndex(cl, -1);
+            if (!v) break;
+            crdtId del_id;
+            hlc_now(&server.crdt_clock, 0, &del_id, NULL);
+            crdtId target_id = v->id;
+            crdtListDeleteVertex(cl, target_id, del_id.hlc, server.crdt_clock.origin_id);
+            if (server.active_active_enabled) {
+                crdtPropagateDelete(c, c->argv[1], target_id, del_id.hlc, server.crdt_clock.origin_id);
+            }
+        }
     } else {
         serverPanic("Unknown list encoding");
     }
@@ -1036,6 +1384,10 @@ void lremCommand(client *c) {
     subject = lookupKeyWriteOrReply(c, c->argv[1], shared.czero);
     if (subject == NULL || checkType(c, subject, OBJ_LIST)) return;
 
+    if (server.active_active_enabled && objectGetEncoding(subject) != OBJ_ENCODING_CRDT_LIST) {
+        listTypeConvertToCrdt(subject);
+    }
+
     listTypeIterator *li;
     if (toremove < 0) {
         toremove = -toremove;
@@ -1047,7 +1399,19 @@ void lremCommand(client *c) {
     listTypeEntry entry;
     while (listTypeNext(li, &entry)) {
         if (listTypeEqual(&entry, obj)) {
-            listTypeDelete(li, &entry);
+            if (objectGetEncoding(subject) == OBJ_ENCODING_CRDT_LIST) {
+                crdtList *cl = objectGetVal(subject);
+                crdtListVertex *v = entry.crdt_entry;
+                crdtId del_id;
+                hlc_now(&server.crdt_clock, 0, &del_id, NULL);
+                crdtId target_id = v->id;
+                crdtListDeleteVertex(cl, target_id, del_id.hlc, server.crdt_clock.origin_id);
+                if (server.active_active_enabled) {
+                    crdtPropagateDelete(c, c->argv[1], target_id, del_id.hlc, server.crdt_clock.origin_id);
+                }
+            } else {
+                listTypeDelete(li, &entry);
+            }
             server.dirty++;
             removed++;
             if (toremove && removed == toremove) break;
@@ -1072,10 +1436,18 @@ void lremCommand(client *c) {
 void lmoveHandlePush(client *c, robj *dstkey, robj *dstobj, robj *value, int where) {
     /* Create the list if the key does not exist */
     if (!dstobj) {
-        dstobj = createListListpackObject();
+        if (server.active_active_enabled) {
+            dstobj = createCrdtListObject();
+        } else {
+            dstobj = createListListpackObject();
+        }
         dbAdd(c->db, dstkey, &dstobj);
+    } else if (server.active_active_enabled && objectGetEncoding(dstobj) != OBJ_ENCODING_CRDT_LIST) {
+        listTypeConvertToCrdt(dstobj);
     }
-    listTypeTryConversionAppend(dstobj, &value, 0, 0, NULL, NULL);
+    if (objectGetEncoding(dstobj) != OBJ_ENCODING_CRDT_LIST) {
+        listTypeTryConversionAppend(dstobj, &value, 0, 0, NULL, NULL);
+    }
     listTypePush(dstobj, value, where);
     signalModifiedKey(c, c->db, dstkey);
     notifyKeyspaceEvent(NOTIFY_LIST, where == LIST_HEAD ? "lpush" : "rpush", dstkey, c->db->id);
@@ -1329,4 +1701,170 @@ void lmpopCommand(client *c) {
 /* BLMPOP timeout numkeys <key> [<key> ...] (LEFT|RIGHT) [COUNT count] */
 void blmpopCommand(client *c) {
     lmpopGenericCommand(c, 2, 1);
+}
+
+/* ======================== Active-Active CRDT Replication ======================== */
+
+void crdtPropagateInsert(client *c, robj *key, crdtId parent_id, crdtId new_id, sds val) {
+    robj *argv[7];
+    argv[0] = createStringObject("CRDT.LINSERT", 12);
+    argv[1] = key;
+    argv[2] = createStringObjectFromLongLong(parent_id.hlc);
+    argv[3] = createStringObjectFromLongLong(parent_id.origin_id);
+    argv[4] = createStringObjectFromLongLong(new_id.hlc);
+    argv[5] = createStringObjectFromLongLong(new_id.origin_id);
+    argv[6] = createStringObject(val, sdslen(val));
+
+    alsoPropagate(c->db->id, argv, 7, PROPAGATE_REPL | PROPAGATE_AOF, c->slot);
+
+    decrRefCount(argv[0]);
+    decrRefCount(argv[2]);
+    decrRefCount(argv[3]);
+    decrRefCount(argv[4]);
+    decrRefCount(argv[5]);
+    decrRefCount(argv[6]);
+}
+
+void crdtPropagateDelete(client *c, robj *key, crdtId target_id, uint64_t del_hlc, uint32_t del_origin) {
+    robj *argv[6];
+    argv[0] = createStringObject("CRDT.LDELETE", 12);
+    argv[1] = key;
+    argv[2] = createStringObjectFromLongLong(target_id.hlc);
+    argv[3] = createStringObjectFromLongLong(target_id.origin_id);
+    argv[4] = createStringObjectFromLongLong(del_hlc);
+    argv[5] = createStringObjectFromLongLong(del_origin);
+
+    alsoPropagate(c->db->id, argv, 6, PROPAGATE_REPL | PROPAGATE_AOF, c->slot);
+
+    decrRefCount(argv[0]);
+    decrRefCount(argv[2]);
+    decrRefCount(argv[3]);
+    decrRefCount(argv[4]);
+    decrRefCount(argv[5]);
+}
+
+/* CRDT.LINSERT <key> <parent_hlc> <parent_node> <new_hlc> <new_node> <value> */
+void crdtLInsertCommand(client *c) {
+    if (c->argc != 7) {
+        addReplyErrorArity(c);
+        return;
+    }
+
+    unsigned long long parent_hlc, new_hlc;
+    long long parent_node_ll, new_node_ll;
+    sds parent_hlc_sds = objectGetVal(c->argv[2]);
+    sds new_hlc_sds = objectGetVal(c->argv[4]);
+
+    if (string2ull(parent_hlc_sds, sdslen(parent_hlc_sds), &parent_hlc) == 0 ||
+        string2ull(new_hlc_sds, sdslen(new_hlc_sds), &new_hlc) == 0) {
+        addReplyError(c, "Invalid HLC timestamp");
+        return;
+    }
+
+    if (string2ll(objectGetVal(c->argv[3]), sdslen(objectGetVal(c->argv[3])), &parent_node_ll) == 0 || parent_node_ll < 0) {
+        addReplyError(c, "Invalid parent origin id");
+        return;
+    }
+
+    if (string2ll(objectGetVal(c->argv[5]), sdslen(objectGetVal(c->argv[5])), &new_node_ll) == 0 || new_node_ll < 0) {
+        addReplyError(c, "Invalid new origin id");
+        return;
+    }
+
+    crdtId parent_id = crdtIdMake((uint64_t)parent_hlc, (uint32_t)parent_node_ll);
+    crdtId new_id = crdtIdMake((uint64_t)new_hlc, (uint32_t)new_node_ll);
+
+    /* Advance local logical clock if remote is ahead */
+    hlc_recv(&server.crdt_clock, 0, new_id);
+
+    /* Track peer ACK / activity */
+    crdtPeerTrackAck((uint32_t)new_node_ll, (uint64_t)new_hlc, mstime());
+
+    robj *lobj = lookupKeyWrite(c->db, c->argv[1]);
+    if (lobj == NULL) {
+        lobj = createCrdtListObject();
+        dbAdd(c->db, c->argv[1], &lobj);
+    } else {
+        if (checkType(c, lobj, OBJ_LIST)) return;
+        if (objectGetEncoding(lobj) != OBJ_ENCODING_CRDT_LIST) {
+            listTypeConvertToCrdt(lobj);
+        }
+    }
+
+    crdtList *cl = objectGetVal(lobj);
+    robj *valobj = getDecodedObject(c->argv[6]);
+    sds val = objectGetVal(valobj);
+    crdtListVertex *v = crdtListInsertAfter(cl, parent_id, new_id, val);
+    decrRefCount(valobj);
+
+    if (v == NULL) {
+        addReplyError(c, "Failed to insert CRDT vertex");
+        return;
+    }
+
+    server.dirty++;
+    signalModifiedKey(c, c->db, c->argv[1]);
+    notifyKeyspaceEvent(NOTIFY_LIST, "crdt.linsert", c->argv[1], c->db->id);
+
+    addReply(c, shared.ok);
+}
+
+/* CRDT.LDELETE <key> <target_hlc> <target_node> <del_hlc> <del_node> */
+void crdtLDeleteCommand(client *c) {
+    if (c->argc != 6) {
+        addReplyErrorArity(c);
+        return;
+    }
+
+    unsigned long long target_hlc, del_hlc;
+    long long target_node_ll, del_node_ll;
+    sds target_hlc_sds = objectGetVal(c->argv[2]);
+    sds del_hlc_sds = objectGetVal(c->argv[4]);
+
+    if (string2ull(target_hlc_sds, sdslen(target_hlc_sds), &target_hlc) == 0 ||
+        string2ull(del_hlc_sds, sdslen(del_hlc_sds), &del_hlc) == 0) {
+        addReplyError(c, "Invalid HLC timestamp");
+        return;
+    }
+
+    if (string2ll(objectGetVal(c->argv[3]), sdslen(objectGetVal(c->argv[3])), &target_node_ll) == 0 || target_node_ll < 0) {
+        addReplyError(c, "Invalid target origin id");
+        return;
+    }
+
+    if (string2ll(objectGetVal(c->argv[5]), sdslen(objectGetVal(c->argv[5])), &del_node_ll) == 0 || del_node_ll < 0) {
+        addReplyError(c, "Invalid del origin id");
+        return;
+    }
+
+    crdtId target_id = crdtIdMake((uint64_t)target_hlc, (uint32_t)target_node_ll);
+    crdtId del_id = crdtIdMake((uint64_t)del_hlc, (uint32_t)del_node_ll);
+
+    /* Advance local logical clock if remote is ahead */
+    hlc_recv(&server.crdt_clock, 0, del_id);
+
+    /* Track peer ACK / activity */
+    crdtPeerTrackAck((uint32_t)del_node_ll, (uint64_t)del_hlc, mstime());
+
+    robj *lobj = lookupKeyWrite(c->db, c->argv[1]);
+    if (lobj == NULL) {
+        /* In CRDTs, delete on a missing key or missing vertex is idempotent */
+        addReply(c, shared.ok);
+        return;
+    }
+
+    if (checkType(c, lobj, OBJ_LIST)) return;
+    if (objectGetEncoding(lobj) != OBJ_ENCODING_CRDT_LIST) {
+        listTypeConvertToCrdt(lobj);
+    }
+
+    crdtList *cl = objectGetVal(lobj);
+    int res = crdtListDeleteVertex(cl, target_id, (uint64_t)del_hlc, (uint32_t)del_node_ll);
+    if (res > 0) {
+        server.dirty++;
+        signalModifiedKey(c, c->db, c->argv[1]);
+        notifyKeyspaceEvent(NOTIFY_LIST, "crdt.ldelete", c->argv[1], c->db->id);
+    }
+
+    addReply(c, shared.ok);
 }

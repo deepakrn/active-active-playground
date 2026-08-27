@@ -2487,7 +2487,12 @@ int replicaLoadPrimaryRDBFromSocket(connection *conn, char *buf, char *eofmark, 
     int empty_db_flags = server.repl_replica_lazy_flush ? EMPTYDB_ASYNC : EMPTYDB_NO_FLAGS;
     int asyncLoading = 0;
 
-    if (server.repl_diskless_load == REPL_DISKLESS_LOAD_SWAPDB) {
+    if (server.active_active_enabled) {
+        /* In Active-Active mode, use FULLRESYNC_MERGE: merge snapshot directly into server.db without flushing */
+        replicationAttachToNewPrimary();
+        dbarray = server.db;
+        functions_lib_ctx = functionsLibCtxGetCurrent();
+    } else if (server.repl_diskless_load == REPL_DISKLESS_LOAD_SWAPDB) {
         /* Initialize empty tempDb dictionaries. */
         diskless_load_tempDb = disklessLoadInitTempDb();
         temp_functions_lib_ctx = disklessLoadFunctionsLibCtxCreate();
@@ -2518,14 +2523,18 @@ int replicaLoadPrimaryRDBFromSocket(connection *conn, char *buf, char *eofmark, 
     connBlock(conn);
     connRecvTimeout(conn, server.repl_timeout * 1000);
 
-    serverLog(LL_NOTICE, "PRIMARY <-> REPLICA sync: Loading DB in memory");
+    if (server.active_active_enabled) {
+        serverLog(LL_NOTICE, "PRIMARY <-> REPLICA sync (FULLRESYNC_MERGE): Loading and non-destructive merging DB in memory");
+    } else {
+        serverLog(LL_NOTICE, "PRIMARY <-> REPLICA sync: Loading DB in memory");
+    }
     startLoading(server.repl_transfer_size, RDBFLAGS_REPLICATION, asyncLoading);
     if (replicationSupportSkipRDBChecksum(conn, 1, *usemark)) rdb.flags |= RIO_FLAG_SKIP_RDB_CHECKSUM;
     int loadingFailed = 0;
     rdbLoadingCtx loadingCtx = {.dbarray = dbarray, .functions_lib_ctx = functions_lib_ctx};
-    /* If we aren't using the swapdb method, then we want to empty the data before loading the rdb */
+    /* If we aren't using the swapdb or active-active merge method, then we want to empty the data before loading the rdb */
     int flags = RDBFLAGS_REPLICATION;
-    if (server.repl_diskless_load != REPL_DISKLESS_LOAD_SWAPDB) flags |= RDBFLAGS_EMPTY_DATA;
+    if (!server.active_active_enabled && server.repl_diskless_load != REPL_DISKLESS_LOAD_SWAPDB) flags |= RDBFLAGS_EMPTY_DATA;
     int retval = rdbLoadRioWithLoadingCtxScopedRdb(&rdb, flags, rsi, &loadingCtx);
     if (retval != RDB_OK) {
         /* RDB loading failed. */
@@ -2544,7 +2553,7 @@ int replicaLoadPrimaryRDBFromSocket(connection *conn, char *buf, char *eofmark, 
         stopLoading(0);
         rioFreeConn(&rdb, NULL);
 
-        if (server.repl_diskless_load == REPL_DISKLESS_LOAD_SWAPDB) {
+        if (!server.active_active_enabled && server.repl_diskless_load == REPL_DISKLESS_LOAD_SWAPDB) {
             /* Discard potentially partially loaded tempDb. */
             moduleFireServerEvent(VALKEYMODULE_EVENT_REPL_ASYNC_LOAD, VALKEYMODULE_SUBEVENT_REPL_ASYNC_LOAD_ABORTED,
                                   NULL);
@@ -2556,7 +2565,7 @@ int replicaLoadPrimaryRDBFromSocket(connection *conn, char *buf, char *eofmark, 
             /* If we received RDB_INCOMPATIBLE, the old data was preserved */
             if (retval == RDB_INCOMPATIBLE) {
                 serverLog(LL_NOTICE, "PRIMARY <-> REPLICA sync: RDB version or signature incompatible, old data preserved");
-            } else {
+            } else if (!server.active_active_enabled) {
                 /* Remove the half-loaded data in case the load failed for other reasons. */
                 serverLog(LL_NOTICE, "PRIMARY <-> REPLICA sync: Discarding the half-loaded data");
                 emptyData(-1, empty_db_flags, replicationEmptyDbCallback);
@@ -2642,9 +2651,17 @@ int replicaLoadPrimaryRDBFromDisk(rdbSaveInfo *rsi) {
     replicationAttachToNewPrimary();
 
     /* We pass RDBFLAGS_EMPTY_DATA to call emptyData() after validating rdb compatibility
-     * and before loading the data from the RDB */
-    serverLog(LL_NOTICE, "PRIMARY <-> REPLICA sync: Loading DB in memory");
-    int retval = rdbLoad(server.rdb_filename, rsi, RDBFLAGS_REPLICATION | RDBFLAGS_EMPTY_DATA);
+     * and before loading the data from the RDB (bypassed in Active-Active mode) */
+    int rdbflags = RDBFLAGS_REPLICATION;
+    if (!server.active_active_enabled) {
+        rdbflags |= RDBFLAGS_EMPTY_DATA;
+    }
+    if (server.active_active_enabled) {
+        serverLog(LL_NOTICE, "PRIMARY <-> REPLICA sync (FULLRESYNC_MERGE): Loading and non-destructive merging DB in memory");
+    } else {
+        serverLog(LL_NOTICE, "PRIMARY <-> REPLICA sync: Loading DB in memory");
+    }
+    int retval = rdbLoad(server.rdb_filename, rsi, rdbflags);
 
     if (retval != RDB_OK) {
         serverLog(LL_WARNING, "Failed trying to load the PRIMARY synchronization "
@@ -2659,7 +2676,7 @@ int replicaLoadPrimaryRDBFromDisk(rdbSaveInfo *rsi) {
         /* If RDB failed compatibility check, we did not load the new data set or flush our old data. */
         if (retval == RDB_INCOMPATIBLE) {
             serverLog(LL_NOTICE, "PRIMARY <-> REPLICA sync: Skipping flush, no new data was loaded.");
-        } else {
+        } else if (!server.active_active_enabled) {
             /* If disk-based RDB loading fails, remove the half-loaded dataset. */
             serverLog(LL_NOTICE, "PRIMARY <-> REPLICA sync: Discarding the half-loaded data");
             emptyData(-1, empty_db_flags, replicationEmptyDbCallback);
