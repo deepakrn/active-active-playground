@@ -2105,6 +2105,35 @@ struct COMMAND_ARG COPY_Args[] = {
 {MAKE_ARG("replace",ARG_TYPE_PURE_TOKEN,-1,"REPLACE",NULL,NULL,CMD_ARG_OPTIONAL,0,NULL)},
 };
 
+/********** CRDT_OP ********************/
+
+#ifndef SKIP_CMD_HISTORY_TABLE
+/* CRDT_OP history */
+#define CRDT_OP_History NULL
+#endif
+
+#ifndef SKIP_CMD_TIPS_TABLE
+/* CRDT_OP tips */
+#define CRDT_OP_Tips NULL
+#endif
+
+#ifndef SKIP_CMD_KEY_SPECS_TABLE
+/* CRDT_OP key specs */
+keySpec CRDT_OP_Keyspecs[1] = {
+{NULL,CMD_KEY_RW|CMD_KEY_UPDATE,KSPEC_BS_INDEX,.bs.index={5},KSPEC_FK_RANGE,.fk.range={0,1,0}}
+};
+#endif
+
+/* CRDT_OP argument table */
+struct COMMAND_ARG CRDT_OP_Args[] = {
+{MAKE_ARG("origin-id",ARG_TYPE_INTEGER,-1,NULL,NULL,NULL,CMD_ARG_NONE,0,NULL)},
+{MAKE_ARG("hlc",ARG_TYPE_INTEGER,-1,NULL,NULL,NULL,CMD_ARG_NONE,0,NULL)},
+{MAKE_ARG("type-id",ARG_TYPE_INTEGER,-1,NULL,NULL,NULL,CMD_ARG_NONE,0,NULL)},
+{MAKE_ARG("op-code",ARG_TYPE_INTEGER,-1,NULL,NULL,NULL,CMD_ARG_NONE,0,NULL)},
+{MAKE_ARG("key",ARG_TYPE_KEY,0,NULL,NULL,NULL,CMD_ARG_NONE,0,NULL)},
+{MAKE_ARG("arg",ARG_TYPE_STRING,-1,NULL,NULL,NULL,CMD_ARG_OPTIONAL|CMD_ARG_MULTIPLE,0,NULL)},
+};
+
 /********** DEL ********************/
 
 #ifndef SKIP_CMD_HISTORY_TABLE
@@ -12019,6 +12048,7 @@ struct COMMAND_STRUCT serverCommandTable[] = {
 {MAKE_CMD("select","Changes the selected database.","O(1)","1.0.0",CMD_DOC_NONE,NULL,NULL,"connection",COMMAND_GROUP_CONNECTION,SELECT_History,0,SELECT_Tips,0,selectCommand,2,CMD_ALLOW_BUSY|CMD_LOADING|CMD_STALE|CMD_FAST,ACL_CATEGORY_CONNECTION|ACL_CATEGORY_FAST,selectDbIdArgs,SELECT_Keyspecs,0,NULL,1),.args=SELECT_Args},
 /* generic */
 {MAKE_CMD("copy","Copies the value of a key to a new key.","O(N) worst case for collections, where N is the number of nested items. O(1) for string values.","6.2.0",CMD_DOC_NONE,NULL,NULL,"generic",COMMAND_GROUP_GENERIC,COPY_History,0,COPY_Tips,0,copyCommand,-3,CMD_WRITE|CMD_DENYOOM,ACL_CATEGORY_KEYSPACE|ACL_CATEGORY_SLOW|ACL_CATEGORY_WRITE,copyDbIdArgs,COPY_Keyspecs,2,NULL,4),.args=COPY_Args},
+{MAKE_CMD("crdt.op","Active-Active CRDT Unified Operation Envelope replication command.","O(1) to O(log N)","8.0.0",CMD_DOC_NONE,NULL,NULL,"generic",COMMAND_GROUP_GENERIC,CRDT_OP_History,0,CRDT_OP_Tips,0,crdtOpCommand,-6,CMD_WRITE|CMD_DENYOOM,ACL_CATEGORY_ADMIN|ACL_CATEGORY_SLOW|ACL_CATEGORY_WRITE,NULL,CRDT_OP_Keyspecs,1,NULL,6),.args=CRDT_OP_Args},
 {MAKE_CMD("del","Deletes one or more keys.","O(N) where N is the number of keys that will be removed. When a key to remove holds a value other than a string, the individual complexity for this key is O(M) where M is the number of elements in the list, set, sorted set or hash. Removing a single key that holds a string value is O(1).","1.0.0",CMD_DOC_NONE,NULL,NULL,"generic",COMMAND_GROUP_GENERIC,DEL_History,0,DEL_Tips,2,delCommand,-2,CMD_WRITE,ACL_CATEGORY_KEYSPACE|ACL_CATEGORY_SLOW|ACL_CATEGORY_WRITE,NULL,DEL_Keyspecs,1,NULL,1),.args=DEL_Args},
 {MAKE_CMD("dump","Returns a serialized representation of the value stored at a key.","O(1) to access the key and additional O(N*M) to serialize it, where N is the number of objects composing the value and M their average size. For small string values the time complexity is thus O(1)+O(1*M) where M is small, so simply O(1).","2.6.0",CMD_DOC_NONE,NULL,NULL,"generic",COMMAND_GROUP_GENERIC,DUMP_History,0,DUMP_Tips,1,dumpCommand,2,CMD_READONLY,ACL_CATEGORY_KEYSPACE|ACL_CATEGORY_READ|ACL_CATEGORY_SLOW,NULL,DUMP_Keyspecs,1,NULL,1),.args=DUMP_Args},
 {MAKE_CMD("exists","Determines whether one or more keys exist.","O(N) where N is the number of keys to check.","1.0.0",CMD_DOC_NONE,NULL,NULL,"generic",COMMAND_GROUP_GENERIC,EXISTS_History,1,EXISTS_Tips,2,existsCommand,-2,CMD_READONLY|CMD_FAST,ACL_CATEGORY_FAST|ACL_CATEGORY_KEYSPACE|ACL_CATEGORY_READ,NULL,EXISTS_Keyspecs,1,NULL,1),.args=EXISTS_Args},

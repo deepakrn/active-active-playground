@@ -251,12 +251,24 @@ size_t crdtDatabaseGCSweep(int dbid, uint64_t h_stable, size_t max_keys) {
                 size_t pruned = crdtListPruneTombstones(cl, h_stable);
                 pruned_total += pruned;
             }
+        } else if (val && val->type == OBJ_SET && objectGetEncoding(val) == OBJ_ENCODING_CRDT_SET) {
+            crdtSet *cs = objectGetVal(val);
+            if (cs && cs->tombstone_count > 0) {
+                size_t pruned = crdtSetPruneTombstones(cs, h_stable);
+                pruned_total += pruned;
+            }
         }
         keys_checked++;
         if (max_keys > 0 && keys_checked >= max_keys) break;
     }
 
     kvstoreIteratorRelease(kvs_it);
+
+    /* Prune hierarchical key tombstones */
+    if (db->crdt_key_tombstones) {
+        pruned_total += crdtKeyTombstonePrune(db->crdt_key_tombstones, h_stable);
+    }
+
     return pruned_total;
 }
 

@@ -2957,6 +2957,7 @@ serverDb *createDatabase(int id) {
     db->blocking_keys_unblock_on_nokey = dictCreate(&objectKeyPointerValueDictType);
     db->ready_keys = dictCreate(&objectKeyPointerValueDictType);
     db->watched_keys = dictCreate(&keylistDictType);
+    db->crdt_key_tombstones = crdtKeyTombstoneDictCreate();
     db->id = id;
     resetDbExpiryState(db);
     return db;

@@ -740,7 +740,12 @@ int rdbLoadBinaryFloatValue(rio *rdb, float *val) {
  * can't be represented in the given RDB version (only for older RDB). */
 int rdbGetObjectType(robj *o, int rdbver) {
     switch (objectGetType(o)) {
-    case OBJ_STRING: return RDB_TYPE_STRING;
+    case OBJ_STRING:
+        if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_STRING)
+            return RDB_TYPE_STRING_CRDT;
+        else if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_COUNTER)
+            return RDB_TYPE_COUNTER_CRDT;
+        return RDB_TYPE_STRING;
     case OBJ_LIST:
         if (objectGetEncoding(o) == OBJ_ENCODING_QUICKLIST || objectGetEncoding(o) == OBJ_ENCODING_LISTPACK)
             return RDB_TYPE_LIST_QUICKLIST_2;
@@ -755,6 +760,8 @@ int rdbGetObjectType(robj *o, int rdbver) {
             return RDB_TYPE_SET;
         else if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK)
             return RDB_TYPE_SET_LISTPACK;
+        else if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_SET)
+            return RDB_TYPE_SET_CRDT;
         else
             serverPanic("Unknown set encoding");
     case OBJ_ZSET:
@@ -777,7 +784,10 @@ int rdbGetObjectType(robj *o, int rdbver) {
                 return RDB_TYPE_HASH;
         else
             serverPanic("Unknown hash encoding");
-    case OBJ_STREAM: return RDB_TYPE_STREAM_LISTPACKS_3;
+    case OBJ_STREAM:
+        if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_STREAM)
+            return RDB_TYPE_STREAM_CRDT;
+        return RDB_TYPE_STREAM_LISTPACKS_3;
     case OBJ_MODULE: return RDB_TYPE_MODULE_2;
     default: serverPanic("Unknown object type");
     }
@@ -945,14 +955,151 @@ ssize_t rdbSaveCrdtListObject(rio *rdb, robj *o, robj *key) {
     return nwritten;
 }
 
+/* Save a CRDT String Object to RDB. */
+ssize_t rdbSaveCrdtStringObject(rio *rdb, robj *o, robj *key) {
+    UNUSED(key);
+    crdtString *cs = objectGetVal(o);
+    ssize_t n = 0, nwritten = 0;
+
+    if ((n = rdbSaveLen(rdb, cs->id.hlc)) == -1) return -1;
+    nwritten += n;
+    if ((n = rdbSaveLen(rdb, cs->id.origin_id)) == -1) return -1;
+    nwritten += n;
+
+    size_t val_len = cs->val ? sdslen(cs->val) : 0;
+    if ((n = rdbSaveRawString(rdb, (unsigned char *)(cs->val ? cs->val : ""), val_len)) == -1) return -1;
+    nwritten += n;
+
+    return nwritten;
+}
+
+/* Save a CRDT Set Object to RDB. */
+ssize_t rdbSaveCrdtSetObject(rio *rdb, robj *o, robj *key) {
+    UNUSED(key);
+    crdtSet *cs = objectGetVal(o);
+    ssize_t n = 0, nwritten = 0;
+
+    size_t count = dictSize(cs->dict);
+    if ((n = rdbSaveLen(rdb, count)) == -1) return -1;
+    nwritten += n;
+
+    dictIterator *di = dictGetSafeIterator(cs->dict);
+    dictEntry *de;
+    while ((de = dictNext(di)) != NULL) {
+        sds member = dictGetKey(de);
+        crdtSetMember *m = dictGetVal(de);
+
+        if ((n = rdbSaveRawString(rdb, (unsigned char *)member, sdslen(member))) == -1) {
+            dictReleaseIterator(di);
+            return -1;
+        }
+        nwritten += n;
+
+        if ((n = rdbSaveLen(rdb, m->t_add)) == -1) { dictReleaseIterator(di); return -1; }
+        nwritten += n;
+        if ((n = rdbSaveLen(rdb, m->add_origin)) == -1) { dictReleaseIterator(di); return -1; }
+        nwritten += n;
+        if ((n = rdbSaveLen(rdb, m->t_rem)) == -1) { dictReleaseIterator(di); return -1; }
+        nwritten += n;
+        if ((n = rdbSaveLen(rdb, m->rem_origin)) == -1) { dictReleaseIterator(di); return -1; }
+        nwritten += n;
+    }
+    dictReleaseIterator(di);
+    return nwritten;
+}
+
+/* Save a CRDT Counter Object to RDB. */
+ssize_t rdbSaveCrdtCounterObject(rio *rdb, robj *o, robj *key) {
+    UNUSED(key);
+    crdtCounter *c = objectGetVal(o);
+    ssize_t n = 0, nwritten = 0;
+
+    if ((n = rdbSaveLen(rdb, c->is_float)) == -1) return -1;
+    nwritten += n;
+    if ((n = rdbSaveLen(rdb, c->num_origins)) == -1) return -1;
+    nwritten += n;
+
+    for (size_t i = 0; i < c->num_origins; i++) {
+        crdtOriginCounter *e = &c->entries[i];
+        if ((n = rdbSaveLen(rdb, e->origin_id)) == -1) return -1;
+        nwritten += n;
+        if ((n = rdbSaveLen(rdb, (uint64_t)e->pos)) == -1) return -1;
+        nwritten += n;
+        if ((n = rdbSaveLen(rdb, (uint64_t)e->neg)) == -1) return -1;
+        nwritten += n;
+        uint64_t pos_fp_low = (uint64_t)(e->pos_fp & 0xFFFFFFFFFFFFFFFFULL);
+        uint64_t pos_fp_high = (uint64_t)(e->pos_fp >> 64);
+        uint64_t neg_fp_low = (uint64_t)(e->neg_fp & 0xFFFFFFFFFFFFFFFFULL);
+        uint64_t neg_fp_high = (uint64_t)(e->neg_fp >> 64);
+        if ((n = rdbSaveLen(rdb, pos_fp_low)) == -1) return -1;
+        nwritten += n;
+        if ((n = rdbSaveLen(rdb, pos_fp_high)) == -1) return -1;
+        nwritten += n;
+        if ((n = rdbSaveLen(rdb, neg_fp_low)) == -1) return -1;
+        nwritten += n;
+        if ((n = rdbSaveLen(rdb, neg_fp_high)) == -1) return -1;
+        nwritten += n;
+    }
+    return nwritten;
+}
+
+/* Save a CRDT Stream Object to RDB. */
+ssize_t rdbSaveCrdtStreamObject(rio *rdb, robj *o, robj *key) {
+    UNUSED(key);
+    crdtStream *cs = objectGetVal(o);
+    ssize_t n = 0, nwritten = 0;
+
+    if ((n = rdbSaveLen(rdb, cs->length)) == -1) return -1;
+    nwritten += n;
+
+    raxIterator ri;
+    raxStart(&ri, cs->entries);
+    raxSeek(&ri, "^", NULL, 0);
+    while (raxNext(&ri)) {
+        crdtStreamEntry *e = ri.data;
+        if ((n = rdbSaveLen(rdb, e->id.ms)) == -1) { raxStop(&ri); return -1; }
+        nwritten += n;
+        if ((n = rdbSaveLen(rdb, e->id.origin_id)) == -1) { raxStop(&ri); return -1; }
+        nwritten += n;
+        if ((n = rdbSaveLen(rdb, e->id.seq)) == -1) { raxStop(&ri); return -1; }
+        nwritten += n;
+
+        if ((n = rdbSaveLen(rdb, e->num_fields)) == -1) { raxStop(&ri); return -1; }
+        nwritten += n;
+
+        for (size_t f = 0; f < e->num_fields; f++) {
+            if ((n = rdbSaveRawString(rdb, (unsigned char *)e->fields[f].field, sdslen(e->fields[f].field))) == -1) {
+                raxStop(&ri);
+                return -1;
+            }
+            nwritten += n;
+            if ((n = rdbSaveRawString(rdb, (unsigned char *)e->fields[f].value, sdslen(e->fields[f].value))) == -1) {
+                raxStop(&ri);
+                return -1;
+            }
+            nwritten += n;
+        }
+    }
+    raxStop(&ri);
+    return nwritten;
+}
+
 /* Save an Object.
  * Returns -1 on error, number of bytes written on success. */
 ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbtype) {
     ssize_t n = 0, nwritten = 0;
     if (objectGetType(o) == OBJ_STRING) {
-        /* Save a string value */
-        if ((n = rdbSaveStringObject(rdb, o)) == -1) return -1;
-        nwritten += n;
+        if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_STRING) {
+            if ((n = rdbSaveCrdtStringObject(rdb, o, key)) == -1) return -1;
+            nwritten += n;
+        } else if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_COUNTER) {
+            if ((n = rdbSaveCrdtCounterObject(rdb, o, key)) == -1) return -1;
+            nwritten += n;
+        } else {
+            /* Save a string value */
+            if ((n = rdbSaveStringObject(rdb, o)) == -1) return -1;
+            nwritten += n;
+        }
     } else if (objectGetType(o) == OBJ_LIST) {
         /* Save a list value */
         if (objectGetEncoding(o) == OBJ_ENCODING_QUICKLIST) {
@@ -1023,6 +1170,9 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
         } else if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
             size_t l = lpBytes((unsigned char *)objectGetVal(o));
             if ((n = rdbSaveRawString(rdb, objectGetVal(o), l)) == -1) return -1;
+            nwritten += n;
+        } else if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_SET) {
+            if ((n = rdbSaveCrdtSetObject(rdb, o, key)) == -1) return -1;
             nwritten += n;
         } else {
             serverPanic("Unknown set encoding");
@@ -1113,11 +1263,15 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
             serverPanic("Unknown hash encoding");
         }
     } else if (objectGetType(o) == OBJ_STREAM) {
-        /* Store how many listpacks we have inside the radix tree. */
-        stream *s = objectGetVal(o);
-        rax *rax = s->rax;
-        if ((n = rdbSaveLen(rdb, raxSize(rax))) == -1) return -1;
-        nwritten += n;
+        if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_STREAM) {
+            if ((n = rdbSaveCrdtStreamObject(rdb, o, key)) == -1) return -1;
+            nwritten += n;
+        } else {
+            /* Store how many listpacks we have inside the radix tree. */
+            stream *s = objectGetVal(o);
+            rax *rax = s->rax;
+            if ((n = rdbSaveLen(rdb, raxSize(rax))) == -1) return -1;
+            nwritten += n;
 
         /* Serialize all the listpacks inside the radix tree as they are,
          * when loading back, we'll use the first entry of each listpack
@@ -1222,7 +1376,8 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
             }
             raxStop(&ri);
         }
-    } else if (objectGetType(o) == OBJ_MODULE) {
+    }
+} else if (objectGetType(o) == OBJ_MODULE) {
         /* Save a module-specific value. */
         ValkeyModuleIO io;
         moduleValue *mv = objectGetVal(o);
@@ -2120,6 +2275,159 @@ robj *rdbLoadCrdtListObject(rio *rdb, int rdbtype, robj *key) {
         }
     }
 
+    return o;
+
+err:
+    decrRefCount(o);
+    return NULL;
+}
+
+/* Load a CRDT String object from RDB. */
+robj *rdbLoadCrdtStringObject(rio *rdb, int rdbtype, robj *key) {
+    UNUSED(rdbtype);
+    UNUSED(key);
+    uint64_t hlc, origin_id;
+    if ((hlc = rdbLoadLen(rdb, NULL)) == RDB_LENERR) return NULL;
+    if ((origin_id = rdbLoadLen(rdb, NULL)) == RDB_LENERR) return NULL;
+
+    sds val = rdbGenericLoadStringObject(rdb, RDB_LOAD_SDS, NULL);
+    if (!val) return NULL;
+
+    crdtId id = crdtIdMake(hlc, (uint32_t)origin_id);
+    robj *o = createCrdtStringObject(id, val);
+    sdsfree(val);
+
+    if (server.active_active_enabled) {
+        hlc_recv(&server.crdt_clock, 0, id);
+    }
+    return o;
+}
+
+/* Load a CRDT Set object from RDB. */
+robj *rdbLoadCrdtSetObject(rio *rdb, int rdbtype, robj *key) {
+    UNUSED(rdbtype);
+    UNUSED(key);
+    uint64_t count;
+    if ((count = rdbLoadLen(rdb, NULL)) == RDB_LENERR) return NULL;
+
+    robj *o = createCrdtSetObject();
+    crdtSet *cs = objectGetVal(o);
+
+    for (uint64_t i = 0; i < count; i++) {
+        sds member = rdbGenericLoadStringObject(rdb, RDB_LOAD_SDS, NULL);
+        if (!member) goto err;
+
+        uint64_t t_add, add_origin, t_rem, rem_origin;
+        if ((t_add = rdbLoadLen(rdb, NULL)) == RDB_LENERR) { sdsfree(member); goto err; }
+        if ((add_origin = rdbLoadLen(rdb, NULL)) == RDB_LENERR) { sdsfree(member); goto err; }
+        if ((t_rem = rdbLoadLen(rdb, NULL)) == RDB_LENERR) { sdsfree(member); goto err; }
+        if ((rem_origin = rdbLoadLen(rdb, NULL)) == RDB_LENERR) { sdsfree(member); goto err; }
+
+        crdtSetMember *m = zmalloc(sizeof(*m));
+        m->t_add = t_add;
+        m->add_origin = (uint32_t)add_origin;
+        m->t_rem = t_rem;
+        m->rem_origin = (uint32_t)rem_origin;
+
+        dictAdd(cs->dict, member, m);
+        if (crdtSetIsMember(m)) {
+            cs->live_count++;
+        } else {
+            cs->tombstone_count++;
+        }
+
+        if (server.active_active_enabled) {
+            if (t_add > 0) hlc_recv(&server.crdt_clock, 0, crdtIdMake(t_add, (uint32_t)add_origin));
+            if (t_rem > 0) hlc_recv(&server.crdt_clock, 0, crdtIdMake(t_rem, (uint32_t)rem_origin));
+        }
+    }
+    return o;
+
+err:
+    decrRefCount(o);
+    return NULL;
+}
+
+/* Load a CRDT Counter object from RDB. */
+robj *rdbLoadCrdtCounterObject(rio *rdb, int rdbtype, robj *key) {
+    UNUSED(rdbtype);
+    UNUSED(key);
+    uint64_t is_float, num_origins;
+    if ((is_float = rdbLoadLen(rdb, NULL)) == RDB_LENERR) return NULL;
+    if ((num_origins = rdbLoadLen(rdb, NULL)) == RDB_LENERR) return NULL;
+
+    robj *o = createCrdtCounterObject((int)is_float);
+    crdtCounter *c = objectGetVal(o);
+
+    for (uint64_t i = 0; i < num_origins; i++) {
+        uint64_t origin_id, pos, neg;
+        uint64_t pos_fp_low, pos_fp_high, neg_fp_low, neg_fp_high;
+        if ((origin_id = rdbLoadLen(rdb, NULL)) == RDB_LENERR) goto err;
+        if ((pos = rdbLoadLen(rdb, NULL)) == RDB_LENERR) goto err;
+        if ((neg = rdbLoadLen(rdb, NULL)) == RDB_LENERR) goto err;
+        if ((pos_fp_low = rdbLoadLen(rdb, NULL)) == RDB_LENERR) goto err;
+        if ((pos_fp_high = rdbLoadLen(rdb, NULL)) == RDB_LENERR) goto err;
+        if ((neg_fp_low = rdbLoadLen(rdb, NULL)) == RDB_LENERR) goto err;
+        if ((neg_fp_high = rdbLoadLen(rdb, NULL)) == RDB_LENERR) goto err;
+
+        crdtCounterIncr(c, (uint32_t)origin_id, (int64_t)pos);
+        crdtCounterIncr(c, (uint32_t)origin_id, -(int64_t)neg);
+        if (is_float) {
+            crdtOriginCounter *entry = &c->entries[c->num_origins - 1];
+            entry->pos_fp = ((crdt_int128)pos_fp_high << 64) | pos_fp_low;
+            entry->neg_fp = ((crdt_int128)neg_fp_high << 64) | neg_fp_low;
+        }
+    }
+    return o;
+
+err:
+    decrRefCount(o);
+    return NULL;
+}
+
+/* Load a CRDT Stream object from RDB. */
+robj *rdbLoadCrdtStreamObject(rio *rdb, int rdbtype, robj *key) {
+    UNUSED(rdbtype);
+    UNUSED(key);
+    uint64_t length;
+    if ((length = rdbLoadLen(rdb, NULL)) == RDB_LENERR) return NULL;
+
+    robj *o = createCrdtStreamObject();
+    crdtStream *cs = objectGetVal(o);
+
+    for (uint64_t i = 0; i < length; i++) {
+        uint64_t ms, origin_id, seq, num_fields;
+        if ((ms = rdbLoadLen(rdb, NULL)) == RDB_LENERR) goto err;
+        if ((origin_id = rdbLoadLen(rdb, NULL)) == RDB_LENERR) goto err;
+        if ((seq = rdbLoadLen(rdb, NULL)) == RDB_LENERR) goto err;
+        if ((num_fields = rdbLoadLen(rdb, NULL)) == RDB_LENERR) goto err;
+
+        crdtStreamID id = { .ms = ms, .origin_id = (uint32_t)origin_id, .seq = (uint32_t)seq };
+        sds *fields = (num_fields > 0) ? zmalloc(num_fields * sizeof(sds)) : NULL;
+        sds *values = (num_fields > 0) ? zmalloc(num_fields * sizeof(sds)) : NULL;
+
+        for (uint64_t f = 0; f < num_fields; f++) {
+            fields[f] = rdbGenericLoadStringObject(rdb, RDB_LOAD_SDS, NULL);
+            values[f] = rdbGenericLoadStringObject(rdb, RDB_LOAD_SDS, NULL);
+            if (!fields[f] || !values[f]) {
+                for (uint64_t k = 0; k <= f; k++) {
+                    if (fields[k]) sdsfree(fields[k]);
+                    if (values[k]) sdsfree(values[k]);
+                }
+                if (fields) zfree(fields);
+                if (values) zfree(values);
+                goto err;
+            }
+        }
+
+        crdtStreamAppend(cs, id, (size_t)num_fields, (const sds*)fields, (const sds*)values);
+        for (uint64_t f = 0; f < num_fields; f++) {
+            sdsfree(fields[f]);
+            sdsfree(values[f]);
+        }
+        if (fields) zfree(fields);
+        if (values) zfree(values);
+    }
     return o;
 
 err:
@@ -3198,6 +3506,22 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
             decrRefCount(o);
             goto emptykey;
         }
+    } else if (rdbtype == RDB_TYPE_STRING_CRDT) {
+        robj keyobj;
+        initStaticStringObject(keyobj, key);
+        if ((o = rdbLoadCrdtStringObject(rdb, rdbtype, &keyobj)) == NULL) return NULL;
+    } else if (rdbtype == RDB_TYPE_SET_CRDT) {
+        robj keyobj;
+        initStaticStringObject(keyobj, key);
+        if ((o = rdbLoadCrdtSetObject(rdb, rdbtype, &keyobj)) == NULL) return NULL;
+    } else if (rdbtype == RDB_TYPE_COUNTER_CRDT) {
+        robj keyobj;
+        initStaticStringObject(keyobj, key);
+        if ((o = rdbLoadCrdtCounterObject(rdb, rdbtype, &keyobj)) == NULL) return NULL;
+    } else if (rdbtype == RDB_TYPE_STREAM_CRDT) {
+        robj keyobj;
+        initStaticStringObject(keyobj, key);
+        if ((o = rdbLoadCrdtStreamObject(rdb, rdbtype, &keyobj)) == NULL) return NULL;
     } else if (server.rdb_version_check == RDB_VERSION_CHECK_RELAXED) {
         /* Future or foreign type. Don't report it as an internal error. */
         if (error) *error = RDB_LOAD_ERR_UNKNOWN_TYPE;
@@ -3458,6 +3782,33 @@ int rdbLoadRioWithLoadingCtxScopedRdb(rio *rdb, int rdbflags, rdbSaveInfo *rsi, 
     int retval = rdbLoadRioWithLoadingCtx(rdb, rdbflags, rsi, rdb_loading_ctx);
     server.loading_rio = prev_rio;
     return retval;
+}
+
+/* Non-destructive CRDT state merge dispatcher across all data types */
+int crdtTypeMerge(robj *existing, robj *incoming) {
+    if (!existing || !incoming) return 0;
+    if (objectGetType(existing) != objectGetType(incoming)) return 0;
+
+    int existing_enc = objectGetEncoding(existing);
+    int incoming_enc = objectGetEncoding(incoming);
+
+    if (existing_enc == OBJ_ENCODING_CRDT_LIST && incoming_enc == OBJ_ENCODING_CRDT_LIST) {
+        crdtListMerge(objectGetVal(existing), objectGetVal(incoming));
+        return 1;
+    } else if (existing_enc == OBJ_ENCODING_CRDT_STRING && incoming_enc == OBJ_ENCODING_CRDT_STRING) {
+        crdtStringMerge(objectGetVal(existing), objectGetVal(incoming));
+        return 1;
+    } else if (existing_enc == OBJ_ENCODING_CRDT_SET && incoming_enc == OBJ_ENCODING_CRDT_SET) {
+        crdtSetMerge(objectGetVal(existing), objectGetVal(incoming));
+        return 1;
+    } else if (existing_enc == OBJ_ENCODING_CRDT_COUNTER && incoming_enc == OBJ_ENCODING_CRDT_COUNTER) {
+        crdtCounterMerge(objectGetVal(existing), objectGetVal(incoming));
+        return 1;
+    } else if (existing_enc == OBJ_ENCODING_CRDT_STREAM && incoming_enc == OBJ_ENCODING_CRDT_STREAM) {
+        crdtStreamMerge(objectGetVal(existing), objectGetVal(incoming));
+        return 1;
+    }
+    return 0;
 }
 
 /* Load an RDB file from the rio stream 'rdb'. We return one of the following:
@@ -3844,13 +4195,9 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
             robj keyobj;
             initStaticStringObject(keyobj, key);
 
-            /* Non-destructive CRDT list merge when key already exists */
+            /* Non-destructive CRDT merge when key already exists */
             robj *existing = lookupKeyWrite(db, &keyobj);
-            if (existing && objectGetType(existing) == OBJ_LIST && objectGetEncoding(existing) == OBJ_ENCODING_CRDT_LIST &&
-                objectGetType(val) == OBJ_LIST && objectGetEncoding(val) == OBJ_ENCODING_CRDT_LIST) {
-                crdtList *local_crdt = objectGetVal(existing);
-                crdtList *remote_crdt = objectGetVal(val);
-                crdtListMerge(local_crdt, remote_crdt);
+            if (existing && crdtTypeMerge(existing, val)) {
                 server.rdb_last_load_keys_loaded++;
                 if (expiretime != -1) {
                     setExpire(NULL, db, &keyobj, expiretime);
@@ -3863,6 +4210,10 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
                 lfu_freq = -1;
                 lru_idle = -1;
                 continue;
+            } else if (existing) {
+                /* Type mismatch between local and incoming CRDT objects:
+                 * Evict existing object before adding incoming to prevent duplicate key assert */
+                dbSyncDelete(db, &keyobj);
             }
 
             /* Add the new object in the hash table */

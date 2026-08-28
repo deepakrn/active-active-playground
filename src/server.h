@@ -82,6 +82,12 @@
 #include "crdt_clock.h" /* CRDT Hybrid Logical Clock Engine */
 #include "crdt_list.h"  /* CRDT Replicated Growable Array (RGA) List Engine */
 #include "crdt_gc.h"    /* CRDT Anti-Entropy & Tombstone GC Subsystem */
+#include "crdt_string.h"
+#include "crdt_set.h"
+#include "crdt_counter.h"
+#include "crdt_stream.h"
+#include "crdt_tombstone.h"
+#include "crdt_envelope.h"
 #include "connection.h" /* Connection abstraction */
 #include "memory_prefetch.h"
 #include "vset.h"
@@ -776,16 +782,17 @@ typedef struct ValkeyModuleType moduleType;
 #define OBJ_ENCODING_RAW 0        /* Raw representation */
 #define OBJ_ENCODING_INT 1        /* Encoded as integer */
 #define OBJ_ENCODING_HASHTABLE 2  /* Encoded as a hashtable */
-#define OBJ_ENCODING_ZIPMAP 3     /* No longer used: old hash encoding. */
-#define OBJ_ENCODING_LINKEDLIST 4 /* No longer used: old list encoding. */
-#define OBJ_ENCODING_ZIPLIST 5    /* No longer used: old list/hash/zset encoding. */
+#define OBJ_ENCODING_CRDT_STREAM 3  /* Encoded as CRDT Disjoint Stream */
+#define OBJ_ENCODING_CRDT_STRING 4  /* Encoded as CRDT LWW String */
+#define OBJ_ENCODING_CRDT_SET 5     /* Encoded as CRDT 2P-LWW Set */
 #define OBJ_ENCODING_INTSET 6     /* Encoded as intset */
 #define OBJ_ENCODING_BTREE 7      /* Encoded as B+tree (fbtree) */
 #define OBJ_ENCODING_EMBSTR 8     /* Embedded sds string encoding */
 #define OBJ_ENCODING_QUICKLIST 9  /* Encoded as linked list of listpacks */
 #define OBJ_ENCODING_STREAM 10    /* Encoded as a radix tree of listpacks */
 #define OBJ_ENCODING_LISTPACK 11  /* Encoded as a listpack */
-#define OBJ_ENCODING_CRDT_LIST 15 /* Encoded as CRDT RGA List */
+#define OBJ_ENCODING_CRDT_COUNTER 14/* Encoded as CRDT PN-Counter */
+#define OBJ_ENCODING_CRDT_LIST 15   /* Encoded as CRDT RGA List */
 
 #define OBJ_REFCOUNT_BITS 29
 #define OBJ_SHARED_REFCOUNT ((1 << OBJ_REFCOUNT_BITS) - 1) /* Global object never destroyed. */
@@ -924,6 +931,7 @@ typedef struct serverDb {
         long long avg_ttl;    /* Average TTL, just for stats */
         unsigned long cursor; /* Cursor of the active expire cycle. */
     } expiry[ACTIVE_EXPIRY_TYPE_COUNT];
+    dict *crdt_key_tombstones; /* Active-Active Key Tombstones */
 } serverDb;
 
 /* forward declaration for functions ctx */
@@ -3195,6 +3203,10 @@ robj *createStringObjectFromLongDouble(long double value, int humanfriendly);
 robj *createQuicklistObject(int fill, int compress);
 robj *createListListpackObject(void);
 robj *createCrdtListObject(void);
+robj *createCrdtStringObject(crdtId id, sds val);
+robj *createCrdtSetObject(void);
+robj *createCrdtCounterObject(int is_float);
+robj *createCrdtStreamObject(void);
 void listTypeConvertToCrdt(robj *o);
 robj *createSetObject(void);
 robj *createIntsetObject(void);
@@ -4055,6 +4067,7 @@ void crdtLInsertCommand(client *c);
 void crdtLDeleteCommand(client *c);
 void crdtGcCommand(client *c);
 void crdtStabilityCommand(client *c);
+void crdtOpCommand(client *c);
 void crdtPropagateInsert(client *c, robj *key, crdtId parent_id, crdtId new_id, sds val);
 void crdtPropagateDelete(client *c, robj *key, crdtId target_id, uint64_t del_hlc, uint32_t del_origin);
 void saddCommand(client *c);

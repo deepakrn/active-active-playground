@@ -312,6 +312,16 @@ int setTypeIsMemberAux(robj *set, char *str, size_t len, int64_t llval, int str_
         int result = hashtableFind(objectGetVal(set), sdsval, NULL);
         sdsfree(sdsval);
         return result;
+    } else if (set->encoding == OBJ_ENCODING_CRDT_SET) {
+        crdtSet *cs = objectGetVal(set);
+        if (str_is_sds) {
+            return crdtSetContains(cs, (sds)str);
+        } else {
+            sds member_sds = sdsnewlen(str, len);
+            int res = crdtSetContains(cs, member_sds);
+            sdsfree(member_sds);
+            return res;
+        }
     } else {
         serverPanic("Unknown set encoding");
     }
@@ -477,6 +487,8 @@ unsigned long setTypeSize(const robj *subject) {
         return intsetLen((const intset *)objectGetVal(subject));
     } else if (subject->encoding == OBJ_ENCODING_LISTPACK) {
         return lpLength((unsigned char *)objectGetVal(subject));
+    } else if (subject->encoding == OBJ_ENCODING_CRDT_SET) {
+        return crdtSetCard(objectGetVal(subject));
     } else {
         serverPanic("Unknown set encoding");
     }

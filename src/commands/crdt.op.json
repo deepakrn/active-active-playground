@@ -1,0 +1,68 @@
+{
+    "CRDT.OP": {
+        "summary": "Active-Active CRDT Unified Operation Envelope replication command.",
+        "complexity": "O(1) to O(log N)",
+        "group": "generic",
+        "since": "8.0.0",
+        "arity": -6,
+        "function": "crdtOpCommand",
+        "command_flags": [
+            "WRITE",
+            "DENYOOM"
+        ],
+        "acl_categories": [
+            "ADMIN",
+            "SLOW",
+            "WRITE"
+        ],
+        "key_specs": [
+            {
+                "flags": [
+                    "RW",
+                    "UPDATE"
+                ],
+                "begin_search": {
+                    "index": {
+                        "pos": 5
+                    }
+                },
+                "find_keys": {
+                    "range": {
+                        "lastkey": 0,
+                        "step": 1,
+                        "limit": 0
+                    }
+                }
+            }
+        ],
+        "arguments": [
+            {
+                "name": "origin-id",
+                "type": "integer"
+            },
+            {
+                "name": "hlc",
+                "type": "integer"
+            },
+            {
+                "name": "type-id",
+                "type": "integer"
+            },
+            {
+                "name": "op-code",
+                "type": "integer"
+            },
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "arg",
+                "type": "string",
+                "multiple": true,
+                "optional": true
+            }
+        ]
+    }
+}

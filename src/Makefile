@@ -501,6 +501,12 @@ ENGINE_SERVER_OBJ = \
     crdt_clock.o \
     crdt_list.o \
     crdt_gc.o \
+    crdt_string.o \
+    crdt_set.o \
+    crdt_counter.o \
+    crdt_stream.o \
+    crdt_tombstone.o \
+    crdt_envelope.o \
     db.o \
     debug.o \
     defrag.o \
@@ -837,8 +843,12 @@ bench: $(ENGINE_BENCHMARK_NAME)
 crdt_list_test: crdt_clock.o crdt_list.o rax.o sds.o zmalloc.o monotonic.o
 	$(QUIET_LINK)$(CC) $(FINAL_CFLAGS) -I. -o ../tests/unit/crdt_list_test ../tests/unit/crdt_list_test.c crdt_clock.o crdt_list.o rax.o sds.o zmalloc.o monotonic.o $(FINAL_LIBS)
 
-test-crdt: crdt_list_test
+crdt_unified_types_test: crdt_clock.o crdt_string.o crdt_set.o crdt_counter.o crdt_stream.o crdt_tombstone.o hashtable.o siphash.o rax.o sds.o zmalloc.o monotonic.o
+	$(QUIET_LINK)$(CC) $(FINAL_CFLAGS) -I. -o ../tests/unit/crdt_unified_types_test ../tests/unit/crdt_unified_types_test.c crdt_clock.o crdt_string.o crdt_set.o crdt_counter.o crdt_stream.o crdt_tombstone.o hashtable.o siphash.o rax.o sds.o zmalloc.o monotonic.o $(FINAL_LIBS)
+
+test-crdt: crdt_list_test crdt_unified_types_test
 	../tests/unit/crdt_list_test
+	../tests/unit/crdt_unified_types_test
 
 32bit:
 	@echo ""

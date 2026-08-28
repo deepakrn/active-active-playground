@@ -531,6 +531,34 @@ robj *createCrdtListObject(void) {
     return o;
 }
 
+robj *createCrdtStringObject(crdtId id, sds val) {
+    crdtString *cs = crdtStringCreate(id, val);
+    robj *o = createObject(OBJ_STRING, cs);
+    objectSetEncoding(o, OBJ_ENCODING_CRDT_STRING);
+    return o;
+}
+
+robj *createCrdtSetObject(void) {
+    crdtSet *cs = crdtSetCreate();
+    robj *o = createObject(OBJ_SET, cs);
+    objectSetEncoding(o, OBJ_ENCODING_CRDT_SET);
+    return o;
+}
+
+robj *createCrdtCounterObject(int is_float) {
+    crdtCounter *c = crdtCounterCreate(is_float);
+    robj *o = createObject(OBJ_STRING, c);
+    objectSetEncoding(o, OBJ_ENCODING_CRDT_COUNTER);
+    return o;
+}
+
+robj *createCrdtStreamObject(void) {
+    crdtStream *cs = crdtStreamCreate();
+    robj *o = createObject(OBJ_STREAM, cs);
+    objectSetEncoding(o, OBJ_ENCODING_CRDT_STREAM);
+    return o;
+}
+
 robj *createSetObject(void) {
     hashtable *ht = hashtableCreate(&setHashtableType);
     robj *o = createObject(OBJ_SET, ht);
@@ -594,6 +622,10 @@ robj *createModuleObject(moduleType *mt, void *value) {
 void freeStringObject(robj *o) {
     if (objectGetEncoding(o) == OBJ_ENCODING_RAW) {
         sdsfree(objectGetVal(o));
+    } else if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_STRING) {
+        crdtStringFree(objectGetVal(o));
+    } else if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_COUNTER) {
+        crdtCounterFree(objectGetVal(o));
     }
 }
 
@@ -614,6 +646,7 @@ void freeSetObject(robj *o) {
     case OBJ_ENCODING_HASHTABLE: hashtableRelease((hashtable *)objectGetVal(o)); break;
     case OBJ_ENCODING_INTSET:
     case OBJ_ENCODING_LISTPACK: zfree(objectGetVal(o)); break;
+    case OBJ_ENCODING_CRDT_SET: crdtSetFree(objectGetVal(o)); break;
     default: serverPanic("Unknown set encoding type");
     }
 }
@@ -650,7 +683,11 @@ void freeModuleObject(robj *o) {
 }
 
 void freeStreamObject(robj *o) {
-    freeStream(objectGetVal(o));
+    if (objectGetEncoding(o) == OBJ_ENCODING_STREAM) {
+        freeStream(objectGetVal(o));
+    } else if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_STREAM) {
+        crdtStreamFree(objectGetVal(o));
+    }
 }
 
 void incrRefCount(robj *o) {
@@ -1219,6 +1256,10 @@ char *strEncoding(int encoding) {
     case OBJ_ENCODING_EMBSTR: return "embstr";
     case OBJ_ENCODING_STREAM: return "stream";
     case OBJ_ENCODING_CRDT_LIST: return "crdt_list";
+    case OBJ_ENCODING_CRDT_STRING: return "crdt_string";
+    case OBJ_ENCODING_CRDT_SET: return "crdt_set";
+    case OBJ_ENCODING_CRDT_COUNTER: return "crdt_counter";
+    case OBJ_ENCODING_CRDT_STREAM: return "crdt_stream";
     default: return "unknown";
     }
 }

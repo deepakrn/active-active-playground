@@ -130,9 +130,17 @@ enum RdbType {
     RDB_TYPE_STREAM_LISTPACKS_3 = 21,
     RDB_TYPE_HASH_2 = 22, /* Hash with field-level expiration, RDB 80 (9.0) */
     RDB_TYPE_LIST_CRDT = 23, /* CRDT List */
+    RDB_TYPE_STRING_CRDT = 24, /* CRDT String */
+    RDB_TYPE_SET_CRDT = 25, /* CRDT Set */
+    RDB_TYPE_COUNTER_CRDT = 26, /* CRDT Counter */
+    RDB_TYPE_STREAM_CRDT = 27, /* CRDT Stream */
     RDB_TYPE_LAST
 };
 #define RDB_TYPE_LIST_CRDT RDB_TYPE_LIST_CRDT
+#define RDB_TYPE_STRING_CRDT RDB_TYPE_STRING_CRDT
+#define RDB_TYPE_SET_CRDT RDB_TYPE_SET_CRDT
+#define RDB_TYPE_COUNTER_CRDT RDB_TYPE_COUNTER_CRDT
+#define RDB_TYPE_STREAM_CRDT RDB_TYPE_STREAM_CRDT
 /* NOTE: WHEN ADDING NEW RDB TYPE, UPDATE rdb_type_string[] */
 
 /* When our RDB format diverges, we need to reject types/opcodes for which we

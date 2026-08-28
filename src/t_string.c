@@ -309,6 +309,20 @@ int getGenericCommand(client *c) {
         return C_ERR;
     }
 
+    if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_STRING) {
+        crdtString *cs = objectGetVal(o);
+        addReplyBulkCBuffer(c, cs->val, sdslen(cs->val));
+        return C_OK;
+    } else if (objectGetEncoding(o) == OBJ_ENCODING_CRDT_COUNTER) {
+        crdtCounter *cc = objectGetVal(o);
+        if (cc->is_float) {
+            addReplyDouble(c, crdtCounterValueFloat(cc));
+        } else {
+            addReplyLongLong(c, crdtCounterValue(cc));
+        }
+        return C_OK;
+    }
+
     addReplyBulk(c, o);
     return C_OK;
 }
